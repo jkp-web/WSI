@@ -1,0 +1,118 @@
+#include <SPI.h>
+
+// --- Pin Definitions ---
+// WARNING: Using a digital pin for VDD is risky. Connect to Arduino's 5V pin for safety.
+const int logicVDD_Pin = 10;
+
+// Hardware SPI pins on Arduino Uno/Nano: MOSI is 11, SCK is 13
+
+// --- SPI Configuration ---
+const long LENS_SPEED = 77000; // or 500000 for newer lenses
+SPISettings lensSettings(LENS_SPEED, MSBFIRST, SPI_MODE3);
+
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("--- Canon Lens Control (Two's Complement Fix) ---");
+  Serial.println("WARNING: Supplying VDD via a digital pin is dangerous.");
+  pinMode(logicVDD_Pin, OUTPUT);
+  digitalWrite(logicVDD_Pin, HIGH);
+  Serial.println("Logic VDD pin 10 set to HIGH.");
+  delay(100);
+  SPI.begin();
+  initializeLens();
+  Serial.println("\nReady for commands.");
+  Serial.println("Enter steps in the format: +steps or -steps");
+  Serial.println("  '+' moves towards minimum focus (e.g., +100)");
+  Serial.println("  '-' moves towards infinity (e.g., -50)");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() > 1) {
+      char direction = input.charAt(0);
+      String numberPart = input.substring(1);
+      int steps = numberPart.toInt();
+      if (steps > 0) {
+        if (direction == '+' || direction == '-') {
+          moveFocusBySteps(steps, direction);
+        } else {
+          Serial.println("Invalid format. Start with '+' or '-'.");
+        }
+      } else {
+        Serial.println("Invalid number of steps.");
+      }
+    } else {
+      Serial.println("Invalid input. Please use format: +steps or -steps");
+    }
+  }
+}
+
+/**
+ * @brief Moves the focus using the correct Two's Complement math for negative steps.
+ * @param steps The number of steps to move (must be a positive integer).
+ * @param direction The direction: '+' for minimum, '-' for infinity.
+ */
+void moveFocusBySteps(int steps, char direction) {
+  uint16_t commandValue;
+
+  if (direction == '-') {
+    Serial.print("Moving towards INFINITY by ");
+    // --- THIS IS THE FIX ---
+    // We create a negative signed 16-bit integer,
+    // then cast it to an unsigned 16-bit integer.
+    // The compiler automatically does the two's complement conversion.
+    // e.g., -50 becomes 65516 (0xFFCE).
+    int16_t signedSteps = -steps;
+    commandValue = (uint16_t)signedSteps;
+
+  } else {
+    Serial.print("Moving towards MINIMUM by ");
+    // Positive numbers are simple, they are the same in signed and unsigned.
+    commandValue = steps;
+  }
+
+  Serial.print(steps);
+  Serial.println(" steps...");
+
+  byte highByte = (commandValue >> 8) & 0xFF;
+  byte lowByte = commandValue & 0xFF;
+
+  SPI.beginTransaction(lensSettings);
+  delayMicroseconds(1000);
+  byte r1 = SPI.transfer(0x44);
+  delayMicroseconds(1000);
+
+  byte r2 = SPI.transfer(highByte);
+  delayMicroseconds(1000);
+
+  byte r3 = SPI.transfer(lowByte);
+  delayMicroseconds(1000);
+  
+  SPI.endTransaction();
+
+  Serial.print("Lens responded with: 0x");
+  Serial.print(r1, HEX);
+  Serial.print(", 0x");
+  Serial.print(r2, HEX);
+  Serial.print(", 0x");
+  Serial.println(r3, HEX);
+  Serial.println("Ready for next command.");
+}
+
+
+void initializeLens() {
+  Serial.println("Sending initialization sequence (0xF2, 0x0A)...");
+  SPI.beginTransaction(lensSettings);
+  byte response1 = SPI.transfer(0xF2);
+  delayMicroseconds(10);
+  byte response2 = SPI.transfer(0x0A);
+  delayMicroseconds(10);
+  SPI.endTransaction();
+  Serial.print("Initialization complete. Lens responded with: 0x");
+  Serial.print(response1, HEX);
+  Serial.print(", 0x");
+  Serial.println(response2, HEX);
+}
