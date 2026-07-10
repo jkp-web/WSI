@@ -1,0 +1,7 @@
+fastapi==0.139.0
+numpy==2.5.1
+Pillow==12.3.0
+pydantic==2.13.4
+pyserial==3.5
+tifffile==2026.6.1
+opencv-python-headless==4.10.0.84

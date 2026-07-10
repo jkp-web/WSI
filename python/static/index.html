@@ -1,0 +1,1307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WSI Scanner Dashboard</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        :root {
+            --bg-deep:    #0e0e0e;
+            --bg-panel:   #181818;
+            --bg-card:    #222222;
+            --border:     #2d2d2d;
+            --text-dim:   #888;
+            --text-main:  #fff;
+            --accent-blue:   #007bff;
+            --accent-green:  #28a745;
+            --accent-amber:  #ffc107;
+            --accent-red:    #dc3545;
+            --accent-cyan:   #17a2b8;
+            --progress-h:    6px;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            font-family: system-ui, sans-serif;
+            background: var(--bg-deep);
+            color: var(--text-main);
+            display: flex;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        /* ── Layout ──────────────────────────────────────────────── */
+        .workspace      { display: flex; width: 100vw; height: 100vh; }
+        .control-column {
+            width: 35vw; min-width: 450px; max-width: 600px;
+            background: var(--bg-panel);
+            border-right: 1px solid var(--border);
+            display: flex; flex-direction: column;
+            height: 100%; overflow-y: auto;
+        }
+        .stitch-column  {
+            flex: 1; background: var(--bg-deep);
+            display: flex; flex-direction: column;
+            padding: 20px; box-sizing: border-box;
+        }
+
+        /* ── Cards ───────────────────────────────────────────────── */
+        .video-box    { padding: 15px; border-bottom: 1px solid var(--border); text-align: center; }
+        .controls-box { padding: 20px; flex: 1; }
+        .control-group {
+            background: var(--bg-card); padding: 15px;
+            border-radius: 8px; margin-bottom: 15px;
+            border: 1px solid var(--border);
+        }
+        .control-group h3 {
+            margin: 0 0 12px 0; font-size: 13px;
+            text-transform: uppercase; letter-spacing: .05em;
+            color: var(--text-dim);
+        }
+
+        /* ── Canvas ──────────────────────────────────────────────── */
+        #videoCanvas {
+            background: #000; width: 100%;
+            aspect-ratio: 4/3; border: 1px solid #444; border-radius: 6px;
+        }
+        .canvas-wrapper {
+            flex: 1; display: flex; align-items: center; justify-content: center;
+            position: relative; width: 100%; height: 100%;
+            border: 2px dashed #333; border-radius: 8px;
+            background: #151515; overflow: hidden;
+        }
+        #stitchCanvas { background: #000; box-shadow: 0 0 15px rgba(0,0,0,.5); }
+
+        /* ── Inputs / Buttons ────────────────────────────────────── */
+        .input-row {
+            display: flex; align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px; font-size: 13px;
+        }
+        input[type="number"] {
+            background: #333; border: 1px solid #555;
+            color: white; padding: 5px;
+            width: 65px; border-radius: 4px; text-align: center;
+        }
+        button {
+            background: #3a3a3a; color: white; border: none;
+            padding: 8px 12px; border-radius: 4px;
+            cursor: pointer; font-weight: 500;
+            transition: background .15s;
+        }
+        button:hover:not(:disabled)  { background: #4a4a4a; }
+        button:disabled              { opacity: .4; cursor: not-allowed; }
+        .btn-primary { background: var(--accent-blue); }
+        .btn-primary:hover:not(:disabled) { background: #0056b3; }
+        .btn-success { background: var(--accent-green); }
+        .btn-success:hover:not(:disabled) { background: #218838; }
+        .btn-warning { background: var(--accent-amber); color: #111; }
+        .btn-warning:hover:not(:disabled) { background: #e0a800; }
+        .btn-danger  { background: var(--accent-red); }
+        .btn-danger:hover:not(:disabled)  { background: #c82333; }
+        .btn-info    { background: var(--accent-cyan); }
+        .btn-info:hover:not(:disabled)    { background: #138496; }
+
+        /* ── D-Pad ───────────────────────────────────────────────── */
+        .d-pad { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; max-width: 160px; margin: 10px auto; }
+        .d-pad button { padding: 10px; margin: 0; }
+
+        /* ── LED mode pills ──────────────────────────────────────── */
+        .led-pills { display: flex; gap: 8px; margin-bottom: 10px; }
+        .led-pills button { flex: 1; padding: 6px 0; font-size: 12px; }
+        .led-active { outline: 2px solid var(--accent-cyan); outline-offset: 1px; }
+
+        /* ── Progress bar ────────────────────────────────────────── */
+        .progress-wrap { margin: 10px 0; }
+        .progress-track {
+            width: 100%; height: var(--progress-h);
+            background: #333; border-radius: 3px; overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%; background: var(--accent-cyan);
+            border-radius: 3px; transition: width .3s ease;
+        }
+        .progress-label {
+            font-size: 11px; color: var(--text-dim);
+            margin-top: 4px; display: flex; justify-content: space-between;
+        }
+
+        /* ── Status badge ────────────────────────────────────────── */
+        .badge {
+            display: inline-block; padding: 2px 8px;
+            border-radius: 12px; font-size: 11px; font-weight: 600;
+            text-transform: uppercase; letter-spacing: .05em;
+        }
+        .badge-scanning  { background: var(--accent-cyan);   color: #000; }
+        .badge-complete  { background: var(--accent-green);  color: #000; }
+        .badge-error     { background: var(--accent-red);    color: #fff; }
+        .badge-prescan   { background: var(--accent-amber);  color: #000; }
+
+        /* ── Scan origin note ────────────────────────────────────── */
+        .origin-note {
+            font-size: 11px; color: var(--accent-amber);
+            padding: 6px 8px; background: rgba(255,193,7,.08);
+            border: 1px solid rgba(255,193,7,.2); border-radius: 4px;
+            margin-bottom: 8px;
+        }
+        .origin-note label { cursor: pointer; display: flex; align-items: center; gap: 6px; }
+        .origin-note input[type="checkbox"] { width: auto; }
+
+        /* ── Scan complete summary ───────────────────────────────── */
+        .scan-summary {
+            font-size: 12px; color: var(--accent-green);
+            padding: 6px 8px; background: rgba(40,167,69,.08);
+            border: 1px solid rgba(40,167,69,.2); border-radius: 4px;
+            margin-top: 8px;
+        }
+        .scan-error-msg {
+            font-size: 12px; color: var(--accent-red);
+            padding: 6px 8px; background: rgba(220,53,69,.08);
+            border: 1px solid rgba(220,53,69,.2); border-radius: 4px;
+            margin-top: 8px;
+        }
+
+        /* ── Canvas legend ───────────────────────────────────────── */
+        .canvas-legend {
+            display: flex; gap: 14px; margin-bottom: 8px;
+            font-size: 11px; color: var(--text-dim);
+        }
+        .legend-dot {
+            width: 10px; height: 10px;
+            border-radius: 2px; flex-shrink: 0;
+        }
+        .canvas-status {
+            font-size: 12px; color: var(--text-dim);
+            text-align: right; margin-bottom: 4px; min-height: 16px;
+        }
+        /* ── Scan paused overlay ─────────────────────────────────── */
+        .pause-overlay {
+            position: fixed; top: 18px; right: 18px; z-index: 100;
+            pointer-events: none;
+        }
+        .pause-card {
+            background: #1a1a1a; border: 2px solid var(--accent-red);
+            border-radius: 12px; padding: 20px 22px; max-width: 440px; width: min(440px, calc(100vw - 36px));
+            text-align: center; box-shadow: 0 12px 36px rgba(0,0,0,.45);
+            pointer-events: auto;
+        }
+        .pause-card-header {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; margin-bottom: 10px;
+        }
+        .pause-close {
+            background: transparent; border: 1px solid #555; color: #bbb;
+            padding: 4px 8px; line-height: 1; font-size: 16px;
+        }
+        .pause-card h3 { color: var(--accent-red); margin: 0 0 10px 0; font-size: 17px; }
+        .pause-card p  { color: #bbb; font-size: 13px; margin: 0 0 6px 0; line-height: 1.5; }
+        .pause-stats   { font-size: 11px; color: var(--text-dim); margin: 8px 0 16px; }
+        .scan-paused-msg {
+            font-size: 12px; color: var(--accent-amber);
+            padding: 8px 10px; background: rgba(255,193,7,.08);
+            border: 1px solid rgba(255,193,7,.22); border-radius: 4px;
+            margin-top: 8px;
+        }
+
+        /* ── Sweep chart ─────────────────────────────────────────── */
+        #sweepCanvas   { width: 100%; height: 80px; background: #111; border-radius: 4px; margin-top: 6px; }
+        .sweep-legend  { display: flex; gap: 14px; font-size: 10px; color: var(--text-dim); margin-top: 3px; }
+        /* ── AF pill badge on canvas status ──────────────────────── */
+        .af-pill      { display:inline-block; padding:1px 6px; border-radius:10px; font-size:10px; font-weight:600; }
+        .af-pill-run  { background: var(--accent-amber); color: #000; }
+        .af-pill-skip { background: #333; color: #666; }
+
+        /* ── FFC calibration card ────────────────────────────────── */
+        .ffc-instruction {
+            font-size: 11px; padding: 6px 8px; border-radius: 4px; margin-bottom: 8px; line-height: 1.5;
+        }
+        .ffc-instruction-dark {
+            color: var(--accent-amber); background: rgba(255,193,7,.08); border: 1px solid rgba(255,193,7,.22);
+        }
+        .ffc-instruction-flat {
+            color: var(--accent-cyan); background: rgba(23,162,184,.08); border: 1px solid rgba(23,162,184,.22);
+        }
+        .ffc-flatness {
+            font-size: 10px; color: var(--text-dim); margin-left: 6px;
+        }
+        /* ── View toggle (Live Tiles ↔ Stitched Preview) ────────────── */
+.view-toggle {
+    display: flex; gap: 0; margin-bottom: 8px;
+    border: 1px solid #444; border-radius: 6px; overflow: hidden;
+    width: fit-content;
+}
+.view-btn {
+    padding: 5px 14px; font-size: 12px; font-weight: 500;
+    background: transparent; color: var(--text-dim);
+    border: none; border-radius: 0; cursor: pointer;
+    transition: background .15s, color .15s;
+}
+.view-btn:hover:not(.view-btn-active) { background: #2a2a2a; color: #ccc; }
+.view-btn-active { background: var(--accent-cyan); color: #fff; }
+.view-btn + .view-btn { border-left: 1px solid #444; }
+
+/* ── Stitched preview image ──────────────────────────────────── */
+#stitchPreview {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+    border-radius: 4px;
+    box-shadow: 0 0 15px rgba(0,0,0,.5);
+    /* hidden until stitchView === 'stitched' via v-show */
+}
+.stitch-preview-placeholder {
+    color: var(--text-dim); font-size: 13px; text-align: center;
+    padding: 20px;
+}
+    </style>
+</head>
+<body>
+
+<div id="app" class="workspace">
+
+    <!-- ═══ SCAN PAUSED OVERLAY ════════════════════════════════════════ -->
+    <div class="pause-overlay" v-if="scanPaused && pauseNoticeVisible">
+        <div class="pause-card">
+            <div class="pause-card-header">
+                <h3>⚠ Focus Failure — Scan Paused</h3>
+                <button class="pause-close" @click="dismissPauseNotice">×</button>
+            </div>
+            <p>{{ pauseInfo.message }}</p>
+            <div class="pause-stats">
+                Tile {{ pauseInfo.tile_index + 1 }} &nbsp;|&nbsp;
+                ({{ pauseInfo.x_mm?.toFixed(2) }}, {{ pauseInfo.y_mm?.toFixed(2) }})mm &nbsp;|&nbsp;
+                T={{ pauseInfo.tenengrad?.toFixed(0) }} &nbsp;|&nbsp;
+                Global median={{ pauseInfo.global_median?.toFixed(0) }}
+            </div>
+            <p style="font-size:11px; color:#888; margin-bottom:18px;">
+                Use the Lens Focus controls in the left panel to re-focus manually on the live stream.
+            </p>
+            <button class="btn-success" style="width:100%; padding:10px;"
+                    @click="resumeScan">▶ Resume Scan</button>
+        </div>
+    </div>
+
+    <!-- ═══ REIMAGE REVIEW OVERLAY ═════════════════════════════════════ -->
+    <div class="pause-overlay" v-if="reimageReview.visible">
+        <div class="pause-card" style="max-width:520px; max-height:82vh; display:flex; flex-direction:column;">
+            <div class="pause-card-header">
+                <h3>⚠ Review Tiles Flagged for Reimaging</h3>
+            </div>
+            <p style="font-size:12px; color:#aaa; margin-bottom:8px;">
+                {{ reimageReview.candidates.length }} tile(s) scored below the focus
+                threshold during the end-of-scan audit. Uncheck any you don't want
+                re-captured, then confirm.
+            </p>
+            <div style="display:flex; gap:10px; margin-bottom:8px;">
+                <button class="btn-primary" style="flex:1;" @click="setAllReimageSelected(true)">Select All</button>
+                <button class="btn-primary" style="flex:1;" @click="setAllReimageSelected(false)">Select None</button>
+            </div>
+            <div style="overflow-y:auto; flex:1; border:1px solid #333; border-radius:6px; padding:4px;">
+                <label v-for="c in reimageReview.candidates" :key="c.filename"
+                       style="display:flex; align-items:center; gap:10px; padding:6px;
+                              border-bottom:1px solid #2a2a2a; cursor:pointer;">
+                    <input type="checkbox"
+                           :checked="reimageReview.selected.includes(c.filename)"
+                           @change="toggleReimageCandidate(c.filename)">
+                    <img :src="`/tmp_scan/${c.thumb_name}`"
+                         style="width:56px; height:42px; object-fit:cover; border-radius:3px; flex-shrink:0;">
+                    <div style="font-size:11px; line-height:1.5;">
+                        r{{ c.row }} c{{ c.col }} &nbsp;|&nbsp;
+                        T={{ c.tanengrad.toFixed(0) }}<span v-if="c.local_reference"> (local ref {{ c.local_reference.toFixed(0) }})</span>
+                        &nbsp;|&nbsp; tissue={{ (c.tissue_fraction * 100).toFixed(1) }}%
+                        &nbsp;|&nbsp;
+                        <span :title="c.flag_reason">{{ c.flag_reason === 'local' ? '📍 local outlier' : c.flag_reason === 'global_floor' ? '⛔ global floor' : '📍⛔ local + floor' }}</span>
+                    </div>
+                </label>
+            </div>
+            <div style="font-size:11px; color:#888; margin:10px 0;">
+                {{ reimageReview.selected.length }} of {{ reimageReview.candidates.length }} selected
+            </div>
+            <button class="btn-success" style="width:100%; padding:10px;"
+                    @click="confirmReimageSelection">▶ Reimage Selected Tiles</button>
+        </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         LEFT COLUMN — Controls
+    ════════════════════════════════════════════════════════════════ -->
+    <div class="control-column">
+
+        <!-- Live video -->
+        <div class="video-box">
+            <h4 style="margin:0 0 10px 0; text-align:left; color:#888;">Live Stream</h4>
+            <canvas id="videoCanvas" width="640" height="480"></canvas>
+            <div style="display:flex; gap:10px; margin-top:10px;">
+                <button class="btn-primary" style="flex:1;" @click="connectCamera">1. Connect Pi</button>
+                <button class="btn-primary" style="flex:1;" @click="connectHardware">2. Connect HW</button>
+            </div>
+        </div>
+
+        <div class="controls-box">
+
+            <!-- Colour gains only — AE handles shutter + analogue gain automatically -->
+            <div class="control-group">
+                <h3>Colour Gains</h3>
+                <div style="font-size:11px; color:var(--text-dim); margin-bottom:8px;">
+                    Auto-exposure always active. Adjust only to correct white balance.
+                </div>
+                <div class="input-row">
+                    <label>Red Gain:</label>
+                    <input type="number" v-model.number="gains.red"  step="0.1" min="0">
+                </div>
+                <div class="input-row">
+                    <label>Blue Gain:</label>
+                    <input type="number" v-model.number="gains.blue" step="0.1" min="0">
+                </div>
+                <button class="btn-success" style="width:100%; margin-top:6px;" @click="applyGains">
+                    Apply Gains
+                </button>
+            </div>
+
+            <!-- Step profiles -->
+            <div class="control-group">
+                <h3>Step Profiles</h3>
+                <div class="input-row">
+                    <label>XY Pitch (mm):</label>
+                    <input type="number" v-model.number="stepConfig.xy" step="0.1">
+                </div>
+                <div class="input-row">
+                    <label>Z Coarse (mm):</label>
+                    <input type="number" v-model.number="stepConfig.z"  step="0.01">
+                </div>
+                <div class="input-row">
+                    <label>Lens Fine (ticks):</label>
+                    <input type="number" v-model.number="stepConfig.lens">
+                </div>
+            </div>
+
+            <!-- CNC navigation -->
+            <div class="control-group">
+                <h3>CNC Stage Navigation</h3>
+                <div class="d-pad">
+                    <div></div>
+                    <button @click="jogCNC('Y', stepConfig.xy)">Y+</button>
+                    <div></div>
+                    <button @click="jogCNC('X', -stepConfig.xy)">X−</button>
+                    <button style="background:#222; color:#555; border:1px solid #333;" disabled>•</button>
+                    <button @click="jogCNC('X', stepConfig.xy)">X+</button>
+                    <div></div>
+                    <button @click="jogCNC('Y', -stepConfig.xy)">Y−</button>
+                    <div></div>
+                </div>
+                <div style="display:flex; gap:10px; margin-top:10px;">
+                    <button style="flex:1;" @click="jogCNC('Z', stepConfig.z)">Z Up ↑</button>
+                    <button style="flex:1;" @click="jogCNC('Z', -stepConfig.z)">Z Down ↓</button>
+                </div>
+            </div>
+
+            <!-- Canon lens -->
+            <div class="control-group">
+                <h3>Canon Lens Focus</h3>
+                <div style="display:flex; gap:10px;">
+                    <button style="flex:1;" @click="jogLens('near')">Near (+)</button>
+                    <button style="flex:1;" @click="jogLens('far')">Far (−)</button>
+                </div>
+            </div>
+
+            <!-- Illumination control -->
+            <div class="control-group">
+                <h3>LED Illumination</h3>
+                <div class="led-pills">
+                    <button
+                        :class="['btn-info', ledMode === 1 ? 'led-active' : '']"
+                        @click="setLedMode(1)">On-Axis (Capture)</button>
+                    <button
+                        :class="['btn-warning', ledMode === 2 ? 'led-active' : '']"
+                        @click="setLedMode(2)">Off-Axis (AF)</button>
+                </div>
+                <div style="font-size:11px; color:var(--text-dim);">
+                    Phase 2 AF toggles this automatically per tile.
+                </div>
+            </div>
+
+            <!-- Scan automation -->
+            <div class="control-group">
+                <h3>
+                    Scan Automation
+                    <span v-if="scanStatus.active" class="badge badge-scanning" style="margin-left:8px;">Scanning</span>
+                    <span v-if="scanStatus.complete && !scanStatus.active" class="badge badge-complete" style="margin-left:8px;">Done</span>
+                </h3>
+
+                <!-- Prescan -->
+                <button
+                    class="btn-warning"
+                    style="width:100%; margin-bottom:8px;"
+                    :disabled="scanStatus.active"
+                    @click="runPrescan">
+                    Run Tissue Prescan
+                </button>
+
+                <!-- Scan progress bar -->
+                <div class="progress-wrap" v-if="scanStatus.active || (scanStatus.complete && scanStatus.total > 0)">
+                    <div class="progress-track">
+                        <div class="progress-fill" :style="{width: scanProgressPct + '%'}"></div>
+                    </div>
+                    <div class="progress-label">
+                        <span>{{ scanStatus.captured }} / {{ scanStatus.total }} tiles</span>
+                        <span>{{ scanProgressPct }}%</span>
+                    </div>
+                </div>
+
+                <!-- Origin confirmation (only shown when prescan done and not scanning) -->
+                <div class="origin-note" v-if="scanReady && !scanStatus.active && !scanStatus.complete">
+                    <label>
+                        <input type="checkbox" v-model="scanOriginConfirmed">
+                        CNC is positioned at scan origin (prescan start point)
+                    </label>
+                    <label style="display:block; margin-top:6px;">
+                        <input type="checkbox" v-model="scanWholeRows">
+                        Scan full bounding-box rows when tissue is found in any tile
+                    </label>
+                </div>
+
+                <!-- Start / Stop scan -->
+                <div style="display:flex; gap:8px; margin-top:6px;">
+                    <button
+                        class="btn-success"
+                        style="flex:1;"
+                        :disabled="!scanReady || !scanOriginConfirmed || scanStatus.active"
+                        @click="runHighResScan">
+                        {{ scanStatus.active ? 'Scanning…' : 'Start High-Res Scan' }}
+                    </button>
+                    <button
+                        class="btn-danger"
+                        style="flex:1;"
+                        v-if="scanStatus.active"
+                        @click="stopScan">
+                        Stop
+                    </button>
+                </div>
+
+                <!-- Completion summary -->
+                <div class="scan-summary" v-if="scanStatus.complete && !scanStatus.active">
+                    ✓ {{ scanStatus.captured }} tiles captured in {{ scanStatus.duration }}s
+                    ({{ (scanStatus.duration / Math.max(scanStatus.captured,1)).toFixed(1) }}s/tile)
+                </div>
+
+                <div class="scan-paused-msg" v-if="scanPaused">
+                    Scan is paused for manual focus correction.
+                    Tile {{ (pauseInfo.tile_index ?? 0) + 1 }}
+                    at ({{ pauseInfo.x_mm?.toFixed(2) }}, {{ pauseInfo.y_mm?.toFixed(2) }})mm.
+                    Use Z or lens controls, then resume.
+                    <div style="display:flex; gap:8px; margin-top:8px;">
+                        <button class="btn-success" style="flex:1;" @click="resumeScan">Resume Scan</button>
+                        <button style="flex:1;" @click="showPauseNotice">Show Pause Notice</button>
+                    </div>
+                </div>
+
+                <!-- Error message -->
+                <div class="scan-error-msg" v-if="scanStatus.errorMsg">
+                    ⚠ {{ scanStatus.errorMsg }}
+                </div>
+            </div>
+
+            <!-- Calibration -->
+            <div class="control-group">
+                <h3>
+                    AF Calibration
+                    <span v-if="afStatus.calibrated" class="badge badge-complete" style="margin-left:8px;">Calibrated</span>
+                    <span v-else class="badge badge-error" style="margin-left:8px;">Uncalibrated</span>
+                </h3>
+                <div style="font-size:11px; color:var(--text-dim); margin-bottom:8px;">
+                    Direction sign: <strong>{{ afStatus.direction_sign ?? 'unknown' }}</strong> &nbsp;|&nbsp;
+                    LUT: {{ afStatus.lut_bins_populated }}/20 bins &nbsp;|&nbsp;
+                    {{ afStatus.calibration_date ?? 'never' }}
+                </div>
+                <button class="btn-info" style="width:100%; margin-bottom:6px;"
+                        :disabled="sweepRunning || scanStatus.active"
+                        @click="runCalibrationSweep">
+                    {{ sweepRunning ? 'Sweep running…' : 'Run Focus Sweep' }}
+                </button>
+                <div class="progress-wrap" v-if="sweepRunning">
+                    <div class="progress-track">
+                        <div class="progress-fill" :style="{width: sweepProgress.pct + '%', background: 'var(--accent-cyan)'}"></div>
+                    </div>
+                    <div class="progress-label">
+                        <span>Step {{ sweepProgress.step }} / {{ sweepProgress.total }}</span>
+                        <span>Ring pos: {{ sweepProgress.ring_pos }}</span>
+                    </div>
+                </div>
+                <!-- Sweep chart: Tenengrad (green) + FCFNN prob (orange) vs ring position -->
+                <canvas id="sweepCanvas" v-show="sweepDone" width="400" height="80"></canvas>
+                <div class="sweep-legend" v-if="sweepDone">
+                    <span>🟢 Tenengrad</span>
+                    <span>🟠 FCFNN prob</span>
+                    <span v-if="afStatus.direction_sign">Sign: {{ afStatus.direction_sign > 0 ? '+1 (near=up)' : '-1 (far=up)' }}</span>
+                </div>
+            </div>
+
+            <!-- Flat-Field Correction -->
+            <div class="control-group">
+                <h3>
+                    Flat-Field Correction
+                    <span v-if="ffcState.loaded && ffcState.step !== 'error'"
+                          class="badge badge-complete" style="margin-left:8px;">Active</span>
+                    <span v-else-if="ffcState.step === 'error'"
+                          class="badge badge-error" style="margin-left:8px;">Error</span>
+                    <span v-else
+                          class="badge badge-error" style="margin-left:8px;">Uncalibrated</span>
+                </h3>
+
+                <!-- Flatness result shown after successful calibration -->
+                <div v-if="ffcState.step === 'done' && ffcState.flatness !== null"
+                     class="scan-summary" style="margin-bottom:8px;">
+                    ✓ Calibrated — flatness {{ ffcState.flatness.toFixed(1) }}%
+                    <span class="ffc-flatness">
+                        {{ ffcState.flatness < 5 ? '(good)' : ffcState.flatness < 10 ? '(acceptable)' : '— consider recapturing flat frame' }}
+                    </span>
+                </div>
+
+                <!-- Error -->
+                <div v-if="ffcState.step === 'error'" class="scan-error-msg" style="margin-bottom:8px;">
+                    ⚠ {{ ffcState.errorMsg }}
+                </div>
+
+                <!-- Step 0: entry button (idle / done / error) -->
+                <button v-if="['idle','done','error'].includes(ffcState.step)"
+                        class="btn-info" style="width:100%;"
+                        :disabled="scanStatus.active"
+                        @click="ffcStart">
+                    {{ ffcState.loaded ? 'Recalibrate FFC' : 'Calibrate Flat-Field' }}
+                </button>
+
+                <!-- Step 1: dark frame -->
+                <template v-if="ffcState.step === 'dark_requested' || ffcState.step === 'dark_capturing'">
+                    <div class="ffc-instruction ffc-instruction-dark">
+                        Cap the lens or turn off the LED, then click <strong>Capture Dark</strong>.
+                        The live stream will go dark — that's expected.
+                    </div>
+                    <button class="btn-warning" style="width:100%;"
+                            :disabled="ffcState.step === 'dark_capturing'"
+                            @click="ffcCaptureDark">
+                        {{ ffcState.step === 'dark_capturing' ? 'Capturing dark frames…' : 'Capture Dark' }}
+                    </button>
+                </template>
+
+                <!-- Step 2: flat frame -->
+                <template v-if="ffcState.step === 'flat_requested' || ffcState.step === 'flat_capturing'">
+                    <div class="ffc-instruction ffc-instruction-flat">
+                        Restore LED. Mount a blank glass slide and focus it.<br>
+                        Use the stage controls above to jog to a clean, dust-free area —
+                        watch the live stream until you see clear, uniform glass.
+                        Click <strong>Capture Flat</strong> when ready.
+                    </div>
+                    <button class="btn-success" style="width:100%;"
+                            :disabled="ffcState.step === 'flat_capturing'"
+                            @click="ffcCaptureFlat">
+                        {{ ffcState.step === 'flat_capturing' ? 'Capturing flat frames…' : 'Capture Flat' }}
+                    </button>
+                </template>
+            </div>
+
+        </div><!-- /controls-box -->
+    </div><!-- /control-column -->
+
+    <!-- ═══════════════════════════════════════════════════════════
+         RIGHT COLUMN — Global Slide Matrix
+    ════════════════════════════════════════════════════════════════ -->
+    <div class="stitch-column">
+
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+            <h2 style="margin:0; font-weight:400;">Global Slide Matrix</h2>
+            <div class="canvas-legend">
+                <div style="display:flex; align-items:center; gap:4px;">
+                    <div class="legend-dot" style="background:lime; opacity:.8;"></div><span>Tissue (prescan)</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:4px;">
+                    <div class="legend-dot" style="background:#555;"></div><span>Scan target</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:4px;">
+                    <div class="legend-dot" style="background:var(--accent-amber);"></div><span>Moving to</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:4px;">
+                    <div class="legend-dot" style="background:var(--accent-cyan);"></div><span>Captured</span>
+                </div>
+            </div>
+        </div>
+
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+            <div class="canvas-status" style="margin:0;">{{ canvasStatus }}</div>
+
+            <!-- Toggle only appears once a scan has started -->
+            <div class="view-toggle" v-show="scanStatus.active || scanStatus.complete">
+                <button :class="['view-btn', stitchView === 'tiles'    ? 'view-btn-active' : '']"
+                        @click="stitchView = 'tiles'">Live Tiles</button>
+                <button :class="['view-btn', stitchView === 'stitched' ? 'view-btn-active' : '']"
+                        @click="stitchView = 'stitched'">Stitched Preview</button>
+            </div>
+        </div>
+
+        <div class="canvas-wrapper">
+            <!-- Live tile canvas — existing, unchanged -->
+            <canvas id="stitchCanvas" v-show="stitchView === 'tiles'"></canvas>
+
+            <!-- Stitched preview — polled from /api/stitch/preview -->
+            <template v-if="stitchView === 'stitched'">
+                <img  v-if="stitchPreviewSrc"
+                      id="stitchPreview"
+                      :src="stitchPreviewSrc"
+                      alt="Stitched mosaic preview" />
+                <div  v-else class="stitch-preview-placeholder">
+                    Stitched preview will appear once tiles are captured…
+                </div>
+            </template>
+        </div>
+
+    </div><!-- /stitch-column -->
+
+</div><!-- /app -->
+
+<script>
+const { createApp, ref, computed, onMounted } = Vue;
+
+createApp({
+    setup() {
+        // ── Reactive state ──────────────────────────────────────────
+        const stepConfig = ref({ xy: 1.0, z: 0.05, lens: 15 });
+        const gains      = ref({ red: 1.8, blue: 1.4 });
+        const ledMode    = ref(1);          // 1 = on-axis, 2 = off-axis
+
+        // Scan state
+        const scanReady           = ref(false);
+        const scanOriginConfirmed = ref(false);
+        const scanWholeRows       = ref(false);
+        const scanStatus = ref({
+            active:   false,
+            complete: false,
+            total:    0,
+            captured: 0,
+            duration: 0,
+            errorMsg: '',
+        });
+
+        // Prescan grid info (updated from prescan events; used for coordinate mapping)
+        const prescanInfo = ref({ step_mm: 0.35, grid_cols: 15, grid_rows: 15 });
+
+        const canvasStatus = ref('');
+
+        // ── Phase 2 reactive state ───────────────────────────────────
+        const scanPaused         = ref(false);
+        const pauseNoticeVisible = ref(false);
+        const pauseInfo          = ref({});
+        const reimageReview      = ref({ visible: false, candidates: [], selected: [] });
+
+        const afStatus      = ref({
+            available: false, model_ready: false, calibrated: false,
+            direction_sign: null, lut_bins_populated: 0, calibration_date: null,
+        });
+        const sweepRunning  = ref(false);
+        const sweepDone     = ref(false);
+        const sweepProgress = ref({ pct: 0, step: 0, total: 0, ring_pos: 0 });
+
+        // ── FFC calibration state ─────────────────────────────────────
+        const ffcState = ref({
+            step:     'idle',   // 'idle' | 'dark_requested' | 'dark_capturing'
+                                // | 'flat_requested' | 'flat_capturing' | 'done' | 'error'
+            loaded:   false,    // calibration files found on disk at startup
+            flatness: null,     // number | null
+            errorMsg: '',
+        });
+
+        // ── Canvas references ────────────────────────────────────────
+        let videoCanvas, videoCtx;
+        let stitchCanvas, stitchCtx;
+
+        // ── Computed ─────────────────────────────────────────────────
+        const scanProgressPct = computed(() => {
+            if (!scanStatus.value.total) return 0;
+            return Math.round((scanStatus.value.captured / scanStatus.value.total) * 100);
+        });
+        // ── Stitch view toggle ───────────────────────────────────────────
+const stitchView       = ref('tiles');   // 'tiles' | 'stitched'
+const stitchPreviewSrc = ref('');
+let   stitchPollTimer  = null;
+const STITCH_POLL_MS   = 2000;
+
+function startStitchPolling() {
+    stopStitchPolling();
+    const poll = () => {
+        fetch('/api/stitch/preview')
+            .then(r => { if (!r.ok) throw new Error('no preview'); return r.blob(); })
+            .then(blob => {
+                const old = stitchPreviewSrc.value;
+                stitchPreviewSrc.value = URL.createObjectURL(blob);
+                if (old) URL.revokeObjectURL(old);
+            })
+            .catch(() => {}); // silently ignore — no tiles yet
+    };
+    poll();                                          // immediate first hit
+    stitchPollTimer = setInterval(poll, STITCH_POLL_MS);
+}
+
+function stopStitchPolling() {
+    if (stitchPollTimer) { clearInterval(stitchPollTimer); stitchPollTimer = null; }
+}
+        // ── Canvas helpers ────────────────────────────────────────────
+
+        /**
+         * Map physical mm coordinates to canvas pixel rect.
+         * Matches prescan orientation: col-0 is at the RIGHT edge (inverted X).
+         */
+        function mmToRect(x_mm, y_mm, step_mm) {
+            const { grid_cols, grid_rows, step_mm: ps } = prescanInfo.value;
+            const totalW = grid_cols * ps;
+            const totalH = grid_rows * ps;
+            const scaleX = stitchCanvas.width  / totalW;
+            const scaleY = stitchCanvas.height / totalH;
+            const pxW = step_mm * scaleX;
+            const pxH = step_mm * scaleY;
+            const pxX = stitchCanvas.width - (x_mm * scaleX) - pxW;   // inverted X
+            const pxY = y_mm * scaleY;
+            return { pxX, pxY, pxW, pxH };
+        }
+
+        /** Draw grey ghost outlines for all planned scan tiles. */
+        function drawScanGhosts(tiles, step_mm) {
+            stitchCtx.strokeStyle = 'rgba(255,255,255,0.35)';
+            stitchCtx.fillStyle   = 'rgba(255,255,255,0.04)';
+            stitchCtx.lineWidth   = 0.8;
+            for (const t of tiles) {
+                const { pxX, pxY, pxW, pxH } = mmToRect(t.x_mm, t.y_mm, step_mm);
+                stitchCtx.fillRect(pxX, pxY, pxW, pxH);
+                stitchCtx.strokeRect(pxX, pxY, pxW, pxH);
+            }
+        }
+
+        /** Highlight the tile currently being moved to. */
+        function drawScanTileMoving(data) {
+            const { pxX, pxY, pxW, pxH } = mmToRect(data.x_mm, data.y_mm, data.step_mm);
+            stitchCtx.fillStyle   = 'rgba(255,193,7,0.45)';
+            stitchCtx.strokeStyle = '#ffc107';
+            stitchCtx.lineWidth   = 1.5;
+            stitchCtx.fillRect(pxX, pxY, pxW, pxH);
+            stitchCtx.strokeRect(pxX, pxY, pxW, pxH);
+        }
+
+        /** Mark a tile as captured (shows thumbnail image) or failed (red tint). */
+        function drawScanTileCapture(data) {
+            const { pxX, pxY, pxW, pxH } = mmToRect(data.x_mm, data.y_mm, data.step_mm);
+
+            if (data.captured && data.thumb_name) {
+                // Load the 160×120 thumbnail saved by scanner.py and paint it into the cell,
+                // then redraw the cyan border on top — same pattern as prescan thumbnails.
+                const img = new Image();
+                img.onload = () => {
+                    stitchCtx.drawImage(img, pxX, pxY, pxW, pxH);
+                    stitchCtx.strokeStyle = '#17a2b8';
+                    stitchCtx.lineWidth   = 1.0;
+                    stitchCtx.strokeRect(pxX, pxY, pxW, pxH);
+                };
+                // Cache-bust so stale browser cache doesn't show a previous scan's tile
+                img.src = `/tmp_scan/${data.thumb_name}?t=${Date.now()}`;
+
+                // Immediate cyan fill while the image loads (avoids flash of grey ghost)
+                stitchCtx.fillStyle = 'rgba(23,162,184,0.25)';
+                stitchCtx.fillRect(pxX, pxY, pxW, pxH);
+
+            } else if (!data.captured) {
+                // Failed SNAP — red tint so misses are immediately visible
+                stitchCtx.fillStyle   = 'rgba(220,53,69,0.45)';
+                stitchCtx.strokeStyle = '#ff4d5e';
+                stitchCtx.lineWidth   = 1.0;
+                stitchCtx.fillRect(pxX, pxY, pxW, pxH);
+                stitchCtx.strokeRect(pxX, pxY, pxW, pxH);
+            }
+        }
+
+        /** Prescan tile drawing (unchanged from original). */
+        function drawPrescanTile(data) {
+            console.log(`Prescan tile → Col:${data.col} Row:${data.row} Tissue:${data.has_tissue}`);
+
+            // Update prescan grid dimensions from the first event
+            prescanInfo.value = {
+                step_mm:   data.step_mm,
+                grid_cols: data.grid_cols,
+                grid_rows: data.grid_rows,
+            };
+
+            const pxW = stitchCanvas.width  / data.grid_cols;
+            const pxH = stitchCanvas.height / data.grid_rows;
+            const pxX = (stitchCanvas.width - pxW) - (data.col * pxW);
+            const pxY = data.row * pxH;
+
+            stitchCtx.strokeStyle = data.has_tissue ? 'lime' : 'rgba(255,0,0,0.15)';
+            stitchCtx.lineWidth   = 1;
+            stitchCtx.strokeRect(pxX, pxY, pxW, pxH);
+
+            if (data.thumb_name) {
+                const img = new Image();
+                img.onload = () => {
+                    stitchCtx.drawImage(img, pxX, pxY, pxW, pxH);
+                    stitchCtx.strokeStyle = data.has_tissue ? 'lime' : 'rgba(255,0,0,0.15)';
+                    stitchCtx.strokeRect(pxX, pxY, pxW, pxH);
+                };
+                img.src = `/tmp_cache/${data.thumb_name}?t=${Date.now()}`;
+            }
+        }
+
+        function drawPrescanBounds(data) {
+            if (!data.bounds) return;
+
+            const pxW = stitchCanvas.width  / 20;
+            const pxH = stitchCanvas.height / 20;
+
+            const step = data.step_mm;
+            const minCol = Math.round(data.bounds.min_x / step);
+            const maxCol = Math.round(data.bounds.max_x / step);
+            const minRow = Math.round(data.bounds.min_y / step);
+            const maxRow = Math.round(data.bounds.max_y / step);
+
+            const x1 = (stitchCanvas.width - pxW) - (maxCol * pxW);
+            const x2 = (stitchCanvas.width - pxW) - (minCol * pxW);
+            const x  = x1;
+            const y  = minRow * pxH;
+            const w  = (x2 - x1) + pxW;
+            const h  = (maxRow - minRow + 1) * pxH;
+
+            stitchCtx.strokeStyle = 'yellow';
+            stitchCtx.lineWidth   = 3;
+            stitchCtx.setLineDash([8, 8]);
+            stitchCtx.strokeRect(x, y, w, h);
+            stitchCtx.setLineDash([]);
+            stitchCtx.fillStyle = 'rgba(255,255,0,0.06)';
+            stitchCtx.fillRect(x, y, w, h);
+        }
+
+        /** Draw focus sweep results: Tenengrad (green) + FCFNN prob (orange) vs ring pos */
+        function drawSweepChart(data) {
+            const canvas = document.getElementById('sweepCanvas');
+            if (!canvas || !data.data || !data.data.length) return;
+            const ctx = canvas.getContext('2d');
+            const W   = canvas.width;
+            const H   = canvas.height;
+            ctx.clearRect(0, 0, W, H);
+            ctx.fillStyle = '#0d0d0d';
+            ctx.fillRect(0, 0, W, H);
+
+            const pts    = data.data;
+            const minPos = Math.min(...pts.map(p => p.ring_pos));
+            const maxPos = Math.max(...pts.map(p => p.ring_pos));
+            const maxT   = Math.max(...pts.map(p => p.tenengrad)) || 1;
+            const span   = maxPos - minPos || 1;
+            const pad    = 6;
+
+            const px = pos => pad + ((pos - minPos) / span) * (W - pad * 2);
+            const pyT = t  => H - pad - (t / maxT) * (H - pad * 2);
+            const pyP = p  => H - pad - p * (H - pad * 2);
+
+            // Tenengrad line (green)
+            ctx.beginPath(); ctx.strokeStyle = '#4caf50'; ctx.lineWidth = 1.5;
+            pts.forEach((p, i) => i === 0 ? ctx.moveTo(px(p.ring_pos), pyT(p.tenengrad))
+                                          : ctx.lineTo(px(p.ring_pos), pyT(p.tenengrad)));
+            ctx.stroke();
+
+            // FCFNN prob line (orange)
+            ctx.beginPath(); ctx.strokeStyle = '#ff9800'; ctx.lineWidth = 1.5;
+            pts.forEach((p, i) => i === 0 ? ctx.moveTo(px(p.ring_pos), pyP(p.prob))
+                                          : ctx.lineTo(px(p.ring_pos), pyP(p.prob)));
+            ctx.stroke();
+
+            // Focus peak marker (white dashed)
+            if (data.focus_pos !== undefined) {
+                ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath(); ctx.moveTo(px(data.focus_pos), 0);
+                ctx.lineTo(px(data.focus_pos), H); ctx.stroke();
+                ctx.setLineDash([]);
+            }
+        }
+
+        // ── Canvas init ──────────────────────────────────────────────
+        onMounted(() => {
+            videoCanvas = document.getElementById('videoCanvas');
+            videoCtx    = videoCanvas.getContext('2d');
+
+            stitchCanvas = document.getElementById('stitchCanvas');
+            stitchCtx    = stitchCanvas.getContext('2d');
+
+            const container = stitchCanvas.parentElement;
+            const size      = Math.min(container.clientWidth, container.clientHeight) - 20;
+            stitchCanvas.width  = size;
+            stitchCanvas.height = size;
+            stitchCanvas.style.position = 'static';
+
+            stitchCtx.fillStyle = '#050505';
+            stitchCtx.fillRect(0, 0, size, size);
+            stitchCtx.font      = '14px system-ui';
+            stitchCtx.fillStyle = '#444';
+            stitchCtx.textAlign = 'center';
+            stitchCtx.fillText('Run prescan to map tissue', size / 2, size / 2);
+
+            startEventWebsocket();
+
+            // Fetch AF calibration status on load
+            fetch('/api/calibration/af_status').then(r => r.json()).then(d => {
+                afStatus.value = d;
+            }).catch(() => {});
+
+            // Fetch FFC status on load — show Active badge if calib files exist on disk
+            fetch('/api/calibration/ffc/status').then(r => r.json()).then(d => {
+                ffcState.value.loaded   = d.loaded;
+                ffcState.value.flatness = d.flatness_pct;
+                if (d.loaded) ffcState.value.step = 'done';
+            }).catch(() => {});
+        });
+
+        // ── WebSockets ───────────────────────────────────────────────
+        let videoWs = null;
+        let videoWsReconnectTimer = null;
+
+        const startVideoWebsocket = () => {
+            if (videoWs && videoWs.readyState <= WebSocket.OPEN) return; // already open/connecting
+            clearTimeout(videoWsReconnectTimer);
+
+            videoWs = new WebSocket(`ws://${window.location.host}/ws/video`);
+            videoWs.binaryType = 'blob';
+
+            videoWs.onmessage = async (event) => {
+                const url = URL.createObjectURL(event.data);
+                const img = new Image();
+                img.onload = () => {
+                    videoCtx.drawImage(img, 0, 0, videoCanvas.width, videoCanvas.height);
+                    URL.revokeObjectURL(url);
+                };
+                img.src = url;
+            };
+
+            videoWs.onerror = (e) => {
+                console.warn('[Video WS] Error — will reconnect', e);
+            };
+
+            videoWs.onclose = (e) => {
+                console.warn(`[Video WS] Closed (${e.code}) — reconnecting in 2s`);
+                videoWsReconnectTimer = setTimeout(startVideoWebsocket, 2000);
+            };
+        };
+
+        const startEventWebsocket = () => {
+            const ws = new WebSocket(`ws://${window.location.host}/ws/events`);
+
+            ws.onopen = () => {
+                console.log('%c[Event WS] Connected', 'color:lime; font-weight:bold');
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+
+                    // ── Prescan events ──────────────────────────────
+                    if (data.event === 'prescan_tile') {
+                        drawPrescanTile(data);
+                        canvasStatus.value = `Prescan: Col ${data.col} / Row ${data.row}`;
+
+                    } else if (data.event === 'prescan_complete') {
+                        // Individual tissue tiles are already highlighted with lime borders —
+                        // the old yellow bounding box has been removed (it obscured tile detail).
+                        scanReady.value    = true;
+                        canvasStatus.value = 'Prescan complete — tissue boundaries mapped';
+
+                    // ── Scan events ─────────────────────────────────
+                    } else if (data.event === 'scan_started') {
+                        scanStatus.value.active   = true;
+                        scanStatus.value.complete = false;
+                        scanStatus.value.total    = data.total_tiles;
+                        scanStatus.value.captured = 0;
+                        scanStatus.value.errorMsg = '';
+
+                        // Clear canvas and draw ghost outlines for all planned tiles.
+                        // prescanInfo must already be set from prescan events this session.
+                        stitchCtx.fillStyle = '#0a0a0a';
+                        stitchCtx.fillRect(0, 0, stitchCanvas.width, stitchCanvas.height);
+                        drawScanGhosts(data.tiles, data.step_mm);
+
+                        canvasStatus.value = `Scan started — ${data.total_tiles} tiles planned`;
+                        startStitchPolling();
+
+                    } else if (data.event === 'scan_tile_moving') {
+                        drawScanTileMoving(data);
+                        canvasStatus.value =
+                            `Moving to tile ${data.tile_index + 1}/${data.total_tiles} ` +
+                            `(${data.x_mm.toFixed(2)}, ${data.y_mm.toFixed(2)})mm`;
+
+                    } else if (data.event === 'scan_tile') {
+                        drawScanTileCapture(data);
+                        scanStatus.value.captured = data.captured_count;
+                        const afBadge = data.af_triggered ? ' 🔧AF' : '';
+                        const median  = data.global_median > 0 ? `  med=${data.global_median.toFixed(0)}` : '';
+                        canvasStatus.value =
+                            `Captured ${data.captured_count}/${data.total_tiles}` +
+                            `  T=${data.tenengrad}${median}${afBadge}`;
+
+                    } else if (data.event === 'scan_paused') {
+                        scanPaused.value         = true;
+                        pauseNoticeVisible.value = true;
+                        pauseInfo.value          = data;
+                        canvasStatus.value = `⚠ Scan paused — focus failure at tile ${data.tile_index + 1}`;
+
+                    } else if (data.event === 'reimage_review_required') {
+                        reimageReview.value = {
+                            visible:    true,
+                            candidates: data.candidates,
+                            // Pre-check everything; user unchecks what to skip.
+                            selected:   data.candidates.map(c => c.filename),
+                        };
+                        canvasStatus.value =
+                            `⚠ ${data.count} tile(s) flagged for low focus — review before reimaging`;
+
+                    } else if (data.event === 'reimage_review_resolved') {
+                        reimageReview.value.visible = false;
+                        canvasStatus.value =
+                            `Reimaging ${data.selected_count} tile(s)` +
+                            (data.skipped_count ? ` — ${data.skipped_count} skipped by user` : '');
+
+                    } else if (data.event === 'scan_complete') {
+                        scanPaused.value         = false;
+                        pauseNoticeVisible.value = false;
+                        scanStatus.value.active   = false;
+                        scanStatus.value.complete = true;
+                        scanStatus.value.captured = data.captured_tiles;
+                        scanStatus.value.total    = data.total_tiles;
+                        scanStatus.value.duration = data.duration_seconds;
+                        canvasStatus.value =
+                            `✓ Scan done — ${data.captured_tiles}/${data.total_tiles} tiles  ` +
+                            `${data.duration_seconds}s`;
+
+                        // ← ADD: final poll after a short delay, then stop
+                        setTimeout(() => {
+                            fetch('/api/stitch/preview')
+                                .then(r => r.ok ? r.blob() : null)
+                                .then(blob => {
+                                    if (!blob) return;
+                                    const old = stitchPreviewSrc.value;
+                                    stitchPreviewSrc.value = URL.createObjectURL(blob);
+                                    if (old) URL.revokeObjectURL(old);
+                                })
+                                .catch(() => {})
+                                .finally(() => stopStitchPolling());
+                            }, 1500);
+
+                    } else if (data.event === 'scan_error') {
+                        scanPaused.value         = false;
+                        pauseNoticeVisible.value = false;
+                        scanStatus.value.active   = false;
+                        scanStatus.value.errorMsg = data.message;
+                        canvasStatus.value = `Error: ${data.message}`;
+                        stopStitchPolling();
+
+                    // ── Calibration events ───────────────────────────
+                    } else if (data.event === 'calibration_sweep_progress') {
+                        sweepRunning.value  = true;
+                        sweepProgress.value = {
+                            pct:      Math.round((data.step / data.total) * 100),
+                            step:     data.step,
+                            total:    data.total,
+                            ring_pos: data.ring_pos,
+                        };
+
+                    } else if (data.event === 'calibration_sweep_result') {
+                        sweepRunning.value = false;
+                        sweepDone.value    = true;
+                        afStatus.value = {
+                            available:           true,
+                            calibrated:          data.sign !== null,
+                            direction_sign:      data.sign,
+                            lut_bins_populated:  (data.lut_bins || []).filter(b => b.n_samples > 0).length,
+                            calibration_date:    new Date().toLocaleDateString(),
+                        };
+                        // Draw the sweep chart after Vue renders the canvas (v-show)
+                        setTimeout(() => drawSweepChart(data), 50);
+
+                    // ── FFC calibration events ────────────────────────
+                    } else if (data.event === 'ffc_dark_requested') {
+                        ffcState.value.step     = 'dark_requested';
+                        ffcState.value.errorMsg = '';
+
+                    } else if (data.event === 'ffc_flat_requested') {
+                        ffcState.value.step = 'flat_requested';
+
+                    } else if (data.event === 'ffc_complete') {
+                        ffcState.value.step     = 'done';
+                        ffcState.value.loaded   = true;
+                        ffcState.value.flatness = data.flatness_pct;
+                    }
+                } catch (err) {
+                    console.error('[Event WS] Parse error:', err);
+                }
+            };
+
+            ws.onerror = (e) => {
+                console.error('%c[Event WS] Error', 'color:red; font-weight:bold', e);
+            };
+
+            ws.onclose = (e) => {
+                console.warn(`[Event WS] Closed (${e.code}) — reconnecting in 2s`);
+                setTimeout(startEventWebsocket, 2000);
+            };
+        };
+
+        // ── API helpers ──────────────────────────────────────────────
+        const post = (url, body = {}) =>
+            fetch(url, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify(body),
+            }).then(r => r.json());
+
+        // ── Connection ───────────────────────────────────────────────
+        const connectCamera = async () => {
+            const res = await post('/api/camera/connect');
+            if (res.status === 'success') startVideoWebsocket();
+        };
+
+        const connectHardware = async () => {
+            const res = await post('/api/hardware/connect');
+            const msg = [
+                `CNC: ${res.cnc ? '✓' : '✗'}`,
+                `Canon: ${res.canon ? '✓' : '✗'}`,
+                `LED: ${res.led ? '✓' : '✗'}`,
+            ].join('  ');
+            alert(`Hardware: ${msg}`);
+        };
+
+        // ── Camera controls ──────────────────────────────────────────
+        const applyGains    = () => post('/api/camera/gains', gains.value);
+
+        // ── LED ──────────────────────────────────────────────────────
+        const setLedMode = async (mode) => {
+            const res = await post('/api/led/mode', { mode });
+            if (res.status === 'ok') ledMode.value = mode;
+        };
+
+        // ── CNC jogging ──────────────────────────────────────────────
+        const jogCNC = (axis, distance) => post('/api/jog/cnc', { axis, distance });
+        const jogLens = (direction) =>
+            post('/api/jog/lens', { direction, steps: stepConfig.value.lens });
+
+        // ── Prescan ──────────────────────────────────────────────────
+        const runPrescan = async () => {
+            // Clear canvas for fresh prescan view
+            stitchCtx.fillStyle = '#050505';
+            stitchCtx.fillRect(0, 0, stitchCanvas.width, stitchCanvas.height);
+            scanReady.value           = false;
+            scanOriginConfirmed.value = false;
+            scanWholeRows.value       = false;
+            scanStatus.value.complete = false;
+            canvasStatus.value        = 'Prescan running…';
+            await post('/api/scan/prescan');
+        };
+
+        // ── High-res scan ────────────────────────────────────────────
+        const runHighResScan = async () => {
+            scanStatus.value.errorMsg = '';
+            const res = await post('/api/scan/highres', {
+                scan_whole_rows: scanWholeRows.value,
+            });
+            if (res.status !== 'started') {
+                scanStatus.value.errorMsg = res.message || 'Failed to start scan.';
+            }
+        };
+
+        const stopScan = () => post('/api/scan/stop');
+
+        // ── Phase 2: resume + calibration ────────────────────────────
+        const resumeScan = async () => {
+            await post('/api/scan/resume');
+            scanPaused.value         = false;
+            pauseNoticeVisible.value = false;
+        };
+
+        const dismissPauseNotice = () => {
+            pauseNoticeVisible.value = false;
+        };
+
+        const showPauseNotice = () => {
+            pauseNoticeVisible.value = true;
+        };
+
+        // ── Reimage review (end-of-scan focus audit) ───────────────────
+        const toggleReimageCandidate = (filename) => {
+            const sel = reimageReview.value.selected;
+            const i = sel.indexOf(filename);
+            if (i === -1) sel.push(filename);
+            else sel.splice(i, 1);
+        };
+
+        const setAllReimageSelected = (checked) => {
+            reimageReview.value.selected = checked
+                ? reimageReview.value.candidates.map(c => c.filename)
+                : [];
+        };
+
+        const confirmReimageSelection = async () => {
+            await post('/api/scan/reimage/confirm', { filenames: reimageReview.value.selected });
+            reimageReview.value.visible = false;
+        };
+
+        const runCalibrationSweep = async () => {
+            sweepRunning.value  = true;
+            sweepDone.value     = false;
+            sweepProgress.value = { pct: 0, step: 0, total: 0, ring_pos: 0 };
+            const res = await post('/api/calibration/sweep');
+            if (res.status !== 'started') {
+                sweepRunning.value  = false;
+                canvasStatus.value  = `Sweep error: ${res.message || 'unknown'}`;
+            }
+        };
+
+        // ── FFC calibration ──────────────────────────────────────────
+        const ffcStart = () => {
+            ffcState.value.step     = 'idle';
+            ffcState.value.errorMsg = '';
+            post('/api/calibration/ffc/start');
+        };
+
+        const ffcCaptureDark = async () => {
+            ffcState.value.step = 'dark_capturing';
+            const res = await post('/api/calibration/ffc/capture_dark');
+            if (res.status !== 'ok') {
+                ffcState.value.step     = 'error';
+                ffcState.value.errorMsg = res.message || 'Dark frame capture failed';
+            }
+            // On success backend emits ffc_flat_requested → WS handler advances step
+        };
+
+        const ffcCaptureFlat = async () => {
+            ffcState.value.step = 'flat_capturing';
+            const res = await post('/api/calibration/ffc/capture_flat');
+            if (res.status !== 'ok') {
+                ffcState.value.step     = 'error';
+                ffcState.value.errorMsg = res.message || 'Flat frame capture failed';
+            }
+            // On success backend emits ffc_complete → WS handler advances step
+        };
+
+        // ── Expose to template ───────────────────────────────────────
+        return {
+            stepConfig, gains, ledMode,
+            scanReady, scanOriginConfirmed, scanWholeRows, scanStatus, scanProgressPct,
+            canvasStatus,
+            scanPaused, pauseInfo,
+            pauseNoticeVisible,
+            reimageReview, toggleReimageCandidate, setAllReimageSelected, confirmReimageSelection,
+            afStatus, sweepRunning, sweepDone, sweepProgress,
+            ffcState, ffcStart, ffcCaptureDark, ffcCaptureFlat,
+            connectCamera, connectHardware,
+            applyGains,
+            setLedMode,
+            jogCNC, jogLens,
+            runPrescan, runHighResScan, stopScan,
+            resumeScan, dismissPauseNotice, showPauseNotice, runCalibrationSweep,
+            stitchView, stitchPreviewSrc,
+        };
+    }
+}).mount('#app');
+</script>
+</body>
+</html>
