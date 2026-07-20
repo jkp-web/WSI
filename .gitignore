@@ -2,3 +2,4 @@
 .cache/
 python/__pycache__/
 python/hardware/__pycache__/
+python/scan_exports

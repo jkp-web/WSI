@@ -99,8 +99,8 @@ class LedModePayload(BaseModel):
     mode: int   # 1 = on-axis (brightfield), 2 = off-axis (AF)
 
 class ConnectHardwarePayload(BaseModel):
-    cnc_port:    str = "/dev/ttyUSB3"
-    canon_port:  str = "/dev/ttyUSB0"
+    cnc_port:    str = "/dev/ttyUSB0"
+    canon_port:  str = "/dev/ttyUSB1"
     led_port:    str = "/dev/ttyUSB1"   # Adjust to match your LED Arduino
 
 class HighResScanPayload(BaseModel):
@@ -196,15 +196,15 @@ async def connect_hardware(payload: ConnectHardwarePayload = ConnectHardwarePayl
     cnc_ok = cnc.connect()
 
     # 2. Connect Canon Lens (Commented out / Disabled)
-    """
+    
     try:
         canon    = CanonLens(port=payload.canon_port)
         canon_ok = True
     except Exception as e:
         print(f"[API] Canon lens failed: {e}")
         canon_ok = False
-    """
-    canon_ok = False  # Hardcoded fallback since the block above is disabled
+    
+    
 
     # 3. Connect LED Controller
     try:
@@ -217,7 +217,7 @@ async def connect_hardware(payload: ConnectHardwarePayload = ConnectHardwarePayl
     # ── Inject hardware refs into scanner and autofocus ──────────────────
     scanner.led = led
     
-    """
+    
     scanner.canon     = canon
     scanner.autofocus = autofocus
 
@@ -226,7 +226,7 @@ async def connect_hardware(payload: ConnectHardwarePayload = ConnectHardwarePayl
         autofocus.canon  = canon
         autofocus.led    = led
         autofocus.cnc    = cnc
-    """
+    
     
     # Safely inject LED into autofocus only if autofocus exists
     if autofocus:
