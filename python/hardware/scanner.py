@@ -8,7 +8,7 @@ by prescan.
 Autofocus (Phase 2) hooks are stubbed in run_scan() — search for the
 'PHASE 2 AF HOOK' comment to see exactly where they slot in.
 
-Outputs written to /tmp/wsi_scan/:
+Outputs written under <STORAGE_ROOT>/tmp/scan/ (see hardware/storage.py):
     tile_r{row:03d}_c{col:03d}.jpg   — JPEG q80 tile from Pi camera
     scan_log.jsonl                   — Per-tile metadata (append-mode, crash-safe)
     scan_config.json                 — Scan parameters for downstream tools
@@ -28,6 +28,7 @@ import shutil
 
 from hardware.corrections import FlatFieldCorrector
 from hardware.stitcher import Stitcher
+from hardware.storage import storage
 # Nominal pixel scale used by the live stitch preview.
 NOMINAL_PIXELS_PER_MM: float = 6627.0
 CROP_MARGIN_PX: int = 500
@@ -41,7 +42,8 @@ FIJI_X_FROM_COL: int = -2194
 FIJI_Y_FROM_COL: int = -304
 FIJI_Y_FROM_ROW: int = -1494
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SCAN_EXPORT_ROOT = os.path.join(PROJECT_ROOT, "scan_exports")
+# Save paths now resolve from the SSD storage root (see hardware/storage.py).
+SCAN_EXPORT_ROOT = storage.exports_root
 
 
 class ScannerRoutine:
@@ -147,7 +149,7 @@ class ScannerRoutine:
         tenengrad_score = round(self.tenengrad(gray), 2)
 
         thumb_filename = f"thumb_r{row:03d}_c{col:03d}.jpg"
-        thumb_path = os.path.join("/tmp/wsi_scan", thumb_filename)
+        thumb_path = os.path.join(storage.scan_live_dir, thumb_filename)
         thumb = cv2.resize(img, (160, 120))
         cv2.imwrite(
             thumb_path,
@@ -283,7 +285,7 @@ class ScannerRoutine:
         Inspect saved tiles on disk, revisit tissue-bearing low-focus tiles,
         refocus, and overwrite the bad JPEGs.
         """
-        tile_dir = "/tmp/wsi_scan"
+        tile_dir = storage.scan_live_dir
         tile_pattern = re.compile(r"^tile_r\d{3}_c\d{3}\.jpg$")
         assessments = []
 
@@ -562,7 +564,7 @@ class ScannerRoutine:
 
         return False, tissue_mask
 
-    async def run_prescan(self, step_mm=0.4, max_cols=20, max_rows=20):
+    async def run_prescan(self, step_mm=0.4, max_cols=15, max_rows=15):
         """Systematic snake-pattern grid prescan — identifies tissue tile positions."""
         self.is_scanning = True
         self.tissue_coordinates = []
@@ -630,7 +632,7 @@ class ScannerRoutine:
                             thumb = cv2.resize(img, (160, 120))
                             thumb_filename = f"tile_{current_col}_{row}.jpg"
                             cv2.imwrite(
-                                os.path.join("/tmp/wsi_prescan", thumb_filename),
+                                os.path.join(storage.prescan_dir, thumb_filename),
                                 thumb,
                                 [int(cv2.IMWRITE_JPEG_QUALITY), 70]
                             )
@@ -692,7 +694,7 @@ class ScannerRoutine:
         print(f"[Prescan] Done. Tissue at {len(self.tissue_coordinates)} tiles.")
 
     def save_tissue_map(self):
-        path = "/tmp/wsi_prescan/tissue_map.json"
+        path = os.path.join(storage.prescan_dir, "tissue_map.json")
         try:
             with open(path, 'w') as f:
                 json.dump(self.tissue_coordinates, f, indent=4)
@@ -822,7 +824,7 @@ class ScannerRoutine:
             scan_whole_rows: bool = False,
             prescan_max_cols: int = 20,
             prescan_max_rows: int = 20,
-            settle_time: float = 0.6,
+            settle_time: float = 0.8,
             feedrate: int = 400,
     ):
         """
@@ -845,7 +847,7 @@ class ScannerRoutine:
 
         self.is_scanning  = True
         scan_start_time   = time.time()
-        os.makedirs("/tmp/wsi_scan", exist_ok=True)
+        os.makedirs(storage.scan_live_dir, exist_ok=True)
 
         # Reset per-scan AF tracking
         self.prev_tile_tenengrad       = None
@@ -863,7 +865,7 @@ class ScannerRoutine:
             )
             print(f"[Scan] Prescan skipped; scanning full {prescan_max_cols}×{prescan_max_rows} prescan area.")
         else:
-            tissue_map_path = "/tmp/wsi_prescan/tissue_map.json"
+            tissue_map_path = os.path.join(storage.prescan_dir, "tissue_map.json")
             try:
                 with open(tissue_map_path) as f:
                     tissue_map = json.load(f)
@@ -939,7 +941,7 @@ class ScannerRoutine:
         loop = asyncio.get_running_loop()
 
         # ── Logging setup ────────────────────────────────────────────────
-        log_path         = "/tmp/wsi_scan/scan_log.jsonl"
+        log_path         = os.path.join(storage.scan_live_dir, "scan_log.jsonl")
         tile_config_rows = []    # Fiji TileConfiguration lines
         captured_count   = 0
         export_dir       = None
@@ -960,6 +962,7 @@ class ScannerRoutine:
             pixels_per_mm=NOMINAL_PIXELS_PER_MM,
             step_mm=scan_step_mm,
             step_y_mm=scan_step_y_mm,  # ← pass independent Y step
+            tile_dir=storage.scan_live_dir,  # relocated off /tmp onto the SSD
         )
 
         # ── Per-tile acquisition loop ────────────────────────────────────
@@ -973,7 +976,7 @@ class ScannerRoutine:
             row  = tile["row"]
             col  = tile["col"]
             filename = f"tile_r{row:03d}_c{col:03d}.jpg"
-            tile_path = os.path.join("/tmp/wsi_scan", filename)
+            tile_path = os.path.join(storage.scan_live_dir, filename)
 
             # Notify UI: currently moving to this tile
             await self.event_queue.put({
@@ -1073,7 +1076,7 @@ class ScannerRoutine:
 
             # ── Post-AF mechanical settle ────────────────────────────────
             if af_triggered:
-                await asyncio.sleep(0.21)
+                await asyncio.sleep(0.51)
 
             # ── Capture high-res SNAP ────────────────────────────────────
             snap_bytes = None
@@ -1212,7 +1215,7 @@ class ScannerRoutine:
                 row, col = tile["row"], tile["col"]
                 x_mm, y_mm = tile["x_mm"], tile["y_mm"]
                 filename = tile["filename"]
-                tile_path = os.path.join("/tmp/wsi_scan", filename)
+                tile_path = os.path.join(storage.scan_live_dir, filename)
                 ridx = tile["reserved_export_index"]
 
                 await self.event_queue.put({
@@ -1362,7 +1365,7 @@ class ScannerRoutine:
                 "y": "col*(-304) + row*(-1494)",
             },
         }
-        with open("/tmp/wsi_scan/scan_config.json", 'w') as f:
+        with open(os.path.join(storage.scan_live_dir, "scan_config.json"), 'w') as f:
             json.dump(scan_config, f, indent=4)
 
         if export_dir:
@@ -1397,11 +1400,11 @@ class ScannerRoutine:
         To use in Fiji:
             Plugins → Stitch → Grid/Collection Stitching
             Type: Positions from file
-            Browse to: /tmp/wsi_scan/TileConfiguration.txt
+            Browse to: <STORAGE_ROOT>/tmp/scan/TileConfiguration.txt
 
         Pixel positions here use the fixed row/col transform configured for Fiji.
         """
-        path = "/tmp/wsi_scan/TileConfiguration.txt"
+        path = os.path.join(storage.scan_live_dir, "TileConfiguration.txt")
         header = (
             "# Fiji Grid/Collection Stitching — Positions from file\n"
             f"# Scan step: {scan_step_mm} mm\n"
@@ -1420,7 +1423,7 @@ class ScannerRoutine:
     # ==================================================================
 
     @staticmethod
-    def regenerate_tileconfig(log_path: str = "/tmp/wsi_scan/scan_log.jsonl"):
+    def regenerate_tileconfig(log_path: str = os.path.join(storage.scan_live_dir, "scan_log.jsonl")):
         """
         Re-generate TileConfiguration.txt from saved tile row/col metadata.
         """
@@ -1435,7 +1438,7 @@ class ScannerRoutine:
             print(f"[Scan] scan_log.jsonl not found at {log_path}")
             return
 
-        out_path = "/tmp/wsi_scan/TileConfiguration.txt"
+        out_path = os.path.join(storage.scan_live_dir, "TileConfiguration.txt")
         with open(out_path, 'w') as f:
             f.write("# Fiji Grid/Collection Stitching — Positions from file\n")
             f.write(f"# X = row*{FIJI_X_FROM_ROW} + col*({FIJI_X_FROM_COL})\n")

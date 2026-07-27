@@ -328,6 +328,44 @@
     ════════════════════════════════════════════════════════════════ -->
     <div class="control-column">
 
+        <!-- Storage (SSD save location) -->
+        <div class="controls-box">
+            <div class="control-group">
+                <h3>0. Save Location (SSD)</h3>
+                <div style="font-size:12px; margin-bottom:6px;">
+                    <span :style="{color: storageState.ready ? '#4caf50' : '#e57373', fontWeight:'bold'}">
+                        {{ storageState.ready ? '● Ready' : '● Not ready' }}
+                    </span>
+                    <span style="color:#888;"> — {{ storageState.root || '(unset)' }}</span>
+                    <div style="color:#888; margin-top:2px;">
+                        mounted: {{ storageState.mount_ok ? 'yes' : 'NO' }} ·
+                        writable: {{ storageState.writable ? 'yes' : 'no' }} ·
+                        free: {{ storageState.free_gib }} GiB
+                    </div>
+                </div>
+                <input v-model="storagePathInput" placeholder="/mnt/ssd/wsi_data"
+                       style="width:100%; box-sizing:border-box; margin-bottom:6px;" />
+                <label style="font-size:11px; color:#888; display:block; margin-bottom:6px;">
+                    <input type="checkbox" v-model="storageAllowSameDevice" />
+                    allow same device as OS (skip SSD-mount guard — advanced)
+                </label>
+                <button class="btn-primary" style="width:100%;" @click="saveStorageConfig">
+                    Save location (restart to apply)
+                </button>
+                <div style="display:flex; gap:6px; margin-top:8px; align-items:center;">
+                    <select v-model="tmpScope" style="flex:1;">
+                        <option value="scan_thumbs">tmp: scan working files</option>
+                        <option value="prescan">tmp: prescan (+ tissue map)</option>
+                        <option value="all">tmp: all</option>
+                    </select>
+                    <button class="btn-warning" @click="clearTmp">Clear tmp</button>
+                </div>
+                <div v-if="storageMsg" style="font-size:11px; color:#bbb; margin-top:6px;">
+                    {{ storageMsg }}
+                </div>
+            </div>
+        </div>
+
         <!-- Live video -->
         <div class="video-box">
             <h4 style="margin:0 0 10px 0; text-align:left; color:#888;">Live Stream</h4>
@@ -668,6 +706,14 @@ createApp({
         const gains      = ref({ red: 1.8, blue: 1.4 });
         const ledMode    = ref(1);          // 1 = on-axis, 2 = off-axis
 
+        // ── Storage (SSD save location) ──────────────────────────────
+        const storageState    = ref({ configured: false, ready: false, root: '', free_gib: 0,
+                                      mount_ok: false, on_separate_device: false, writable: false });
+        const storagePathInput      = ref('');
+        const storageAllowSameDevice = ref(false);
+        const storageMsg            = ref('');
+        const tmpScope              = ref('scan_thumbs');
+
         // Scan state
         const scanReady           = ref(false);
         const scanOriginConfirmed = ref(false);
@@ -941,6 +987,9 @@ function stopStitchPolling() {
 
             startEventWebsocket();
 
+            // Fetch storage (SSD) status on load
+            fetchStorageStatus();
+
             // Fetch AF calibration status on load
             fetch('/api/calibration/af_status').then(r => r.json()).then(d => {
                 afStatus.value = d;
@@ -1170,6 +1219,47 @@ function stopStitchPolling() {
             alert(`Hardware: ${msg}`);
         };
 
+        // ── Storage (SSD save location) ──────────────────────────────
+        const fetchStorageStatus = async () => {
+            try {
+                const d = await fetch('/api/storage/config').then(r => r.json());
+                storageState.value = d;
+                if (!storagePathInput.value && d.root) storagePathInput.value = d.root;
+            } catch (e) { /* server may be starting */ }
+        };
+
+        const saveStorageConfig = async () => {
+            storageMsg.value = 'Saving…';
+            const res = await post('/api/storage/config', {
+                root: storagePathInput.value,
+                allow_same_device: storageAllowSameDevice.value,
+            });
+            if (res.ok) {
+                storageMsg.value = 'Saved. Restart the server for it to take effect.';
+            } else {
+                storageMsg.value = `Rejected: ${res.reason || 'unknown error'}`;
+            }
+            fetchStorageStatus();
+        };
+
+        const clearTmp = async () => {
+            const scope = tmpScope.value;
+            if (scope !== 'scan_thumbs') {
+                const ok = confirm(
+                    `Scope "${scope}" also deletes tissue_map.json — you'll have to re-run ` +
+                    `prescan before the next scan (unless skip_prescan). Continue?`
+                );
+                if (!ok) return;
+            }
+            const res = await post('/api/storage/tmp/clear', { scope });
+            if (res.ok) {
+                storageMsg.value = `Cleared ${res.removed_entries} item(s), freed ${res.freed_gib} GiB.`;
+            } else {
+                storageMsg.value = `Clear failed: ${res.reason || 'unknown error'}`;
+            }
+            fetchStorageStatus();
+        };
+
         // ── Camera controls ──────────────────────────────────────────
         const applyGains    = () => post('/api/camera/gains', gains.value);
 
@@ -1293,6 +1383,8 @@ function stopStitchPolling() {
             afStatus, sweepRunning, sweepDone, sweepProgress,
             ffcState, ffcStart, ffcCaptureDark, ffcCaptureFlat,
             connectCamera, connectHardware,
+            storageState, storagePathInput, storageAllowSameDevice, storageMsg, tmpScope,
+            saveStorageConfig, clearTmp,
             applyGains,
             setLedMode,
             jogCNC, jogLens,

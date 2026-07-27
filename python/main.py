@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from camera_client import CameraClient
+from hardware.storage import storage
 from hardware.cnc_controller import CNCController
 from hardware.canon_lens import CanonLens
 from hardware.led_controller import LedController
@@ -41,11 +42,20 @@ if not os.path.exists(static_dir):
 
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-os.makedirs("/tmp/wsi_prescan", exist_ok=True)
-os.makedirs("/tmp/wsi_scan",    exist_ok=True)
+# Storage root (SSD) is resolved at startup by hardware.storage. The dirs were
+# already created on import; ensure again defensively before mounting.
+storage.ensure_dirs()
+if not storage.configured:
+    print("[Main] Storage root NOT configured — set it in the browser and restart. "
+          "Running against local fallback until then; scans will be refused.")
+elif not storage.mount_ok():
+    print(f"[Main] WARNING: storage root {storage.root} appears to be on the OS disk "
+          "(SSD unmounted?). Scans will be refused until the mount is fixed.")
 
-app.mount("/tmp_cache", StaticFiles(directory="/tmp/wsi_prescan"), name="tmp_cache")
-app.mount("/tmp_scan",  StaticFiles(directory="/tmp/wsi_scan"),    name="tmp_scan")
+# Live-preview static mounts. Bound ONCE at startup (StaticFiles cannot be
+# re-pointed at runtime), which is why the save location is set-then-restart.
+app.mount("/tmp_cache", StaticFiles(directory=storage.prescan_dir),   name="tmp_cache")
+app.mount("/tmp_scan",  StaticFiles(directory=storage.scan_live_dir), name="tmp_scan")
 
 # ------------------------------------------------------------------
 # Hardware globals  (connected lazily via /api/hardware/connect)
@@ -66,7 +76,7 @@ except Exception as e:
 scanner = ScannerRoutine(cnc=cnc, camera=camera)
 
 # FFC — load calibration from disk if it exists; injected into scanner after load
-ffc = FlatFieldCorrector()
+ffc = FlatFieldCorrector(calib_dir=storage.calib_dir)
 _ffc_loaded = ffc.load()
 if _ffc_loaded:
     scanner.ffc = ffc
@@ -100,7 +110,7 @@ class LedModePayload(BaseModel):
 
 class ConnectHardwarePayload(BaseModel):
     cnc_port:    str = "/dev/ttyUSB0"
-    canon_port:  str = "/dev/ttyUSB1"
+    canon_port:  str = "/dev/ttyUSB2"
     led_port:    str = "/dev/ttyUSB1"   # Adjust to match your LED Arduino
 
 class HighResScanPayload(BaseModel):
@@ -109,6 +119,13 @@ class HighResScanPayload(BaseModel):
 class ReimageSelectionPayload(BaseModel):
     filenames:  list[str] = []
     select_all: bool      = False
+
+class StorageConfigPayload(BaseModel):
+    root:              str
+    allow_same_device: bool = False   # override the SSD-mount guard (advanced)
+
+class TmpClearPayload(BaseModel):
+    scope: str = "scan_thumbs"        # 'scan_thumbs' | 'prescan' | 'all'
 
 # ------------------------------------------------------------------
 # WebSocket event broadcaster  (scanner → browser)
@@ -165,6 +182,54 @@ async def favicon():
     # Silence browser favicon requests — no icon file needed for this tool
     from fastapi.responses import Response
     return Response(status_code=204)
+
+# ------------------------------------------------------------------
+# Storage configuration (SSD save location)
+# ------------------------------------------------------------------
+def _storage_not_ready_msg() -> str:
+    if not storage.configured:
+        return "Storage location not set. Set the SSD save folder in the browser and restart."
+    if not storage.mount_ok():
+        return (f"Storage root {storage.root} looks unmounted (same device as OS). "
+                "Mount the SSD and restart before scanning.")
+    if not storage.is_writable():
+        return f"Storage root {storage.root} is not writable by the service."
+    return (f"Storage root {storage.root} has less than {storage.status()['min_free_gib']} GiB free.")
+
+@app.get("/api/storage/config")
+async def storage_config_get():
+    """Current storage state for the browser panel (path, mount, free space)."""
+    return storage.status()
+
+@app.post("/api/storage/config")
+async def storage_config_set(payload: StorageConfigPayload):
+    """
+    Validate and persist a new SSD save location. Does NOT rebind the running
+    process — static mounts and FFC load are bound at startup — so a restart is
+    required for it to take effect. Response includes requires_restart=True.
+    """
+    result = storage.set_root(payload.root, allow_same_device=payload.allow_same_device)
+    status = 200 if result.get("ok") else 400
+    return JSONResponse(result, status_code=status)
+
+@app.post("/api/storage/tmp/clear")
+async def storage_tmp_clear(payload: TmpClearPayload):
+    """
+    Delete working files under tmp/. Guarded: never runs during a scan, and can
+    only ever touch dirs inside tmp/. 'prescan'/'all' also wipe tissue_map.json,
+    which forces a re-prescan next run — the frontend confirms that separately.
+    """
+    if scanner.is_scanning:
+        return JSONResponse(
+            {"ok": False, "reason": "Cannot clear tmp while a scan is running."},
+            status_code=409,
+        )
+    if not storage.mount_ok():
+        return JSONResponse(
+            {"ok": False, "reason": "Storage not mounted correctly — refusing to clear."},
+            status_code=409,
+        )
+    return storage.clear_tmp(payload.scope)
 
 # ------------------------------------------------------------------
 # Camera
@@ -282,6 +347,8 @@ async def set_led_mode(payload: LedModePayload):
 async def start_prescan(bg: BackgroundTasks):
     if scanner.is_scanning:
         return {"status": "error", "message": "Scan already running"}
+    if not storage.is_ready():
+        return {"status": "error", "message": _storage_not_ready_msg()}
     bg.add_task(scanner.run_prescan)
     return {"status": "started"}
 
@@ -302,6 +369,8 @@ async def start_highres_scan(
     """
     if scanner.is_scanning:
         return {"status": "error", "message": "Scan already running"}
+    if not storage.is_ready():
+        return {"status": "error", "message": _storage_not_ready_msg()}
 
     # Set current CNC position as the absolute origin for this scan
     loop = asyncio.get_running_loop()
@@ -449,6 +518,8 @@ async def ffc_capture_flat():
     global _ffc_dark_frames, _ffc_loaded
     if not _ffc_dark_frames:
         return {"status": "error", "message": "No dark frames found — run dark capture first"}
+    if not storage.mount_ok():
+        return {"status": "error", "message": _storage_not_ready_msg()}
 
     loop = asyncio.get_running_loop()
     frames = []

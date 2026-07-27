@@ -1,0 +1,4 @@
+{
+  "storage_root": "/app/ssd",
+  "allow_same_device": false
+}

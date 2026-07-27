@@ -2,12 +2,14 @@ import os
 import numpy as np
 import cv2
 
-CALIB_DIR = "/tmp/wsi_scan/calib"
+from hardware.storage import storage
 
 class FlatFieldCorrector:
 
-    def __init__(self, calib_dir: str = CALIB_DIR):
-        self.calib_dir = calib_dir
+    def __init__(self, calib_dir: str | None = None):
+        # Default to the SSD calibration/ folder (persistent, decoupled from scan
+        # output). Pass an explicit dir only for tests/overrides.
+        self.calib_dir = calib_dir or storage.calib_dir
         self.dark:  np.ndarray | None = None   # float32, H×W×3
         self.flat:  np.ndarray | None = None   # float32, H×W×3
         self._gain: np.ndarray | None = None   # precomputed per-pixel, H×W×3
