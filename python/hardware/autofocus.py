@@ -42,6 +42,21 @@ class _AFConfig:
         self.sweep_range               = int(d.get("sweep_range_steps", 300))
         self.sweep_step                = int(d.get("sweep_step_size", 15))
 
+        # ── End-of-scan rescan ladder ─────────────────────────────────────────
+        # Rescan tiles are spatially far apart, so focus can differ a lot from
+        # wherever the ring happens to be sitting. Direction finding therefore
+        # uses a much wider probe than the in-scan fine_step, and the climb a
+        # much finer one.
+        self.rescan_probe_steps        = max(10, int(d.get("rescan_probe_steps", 100)))
+        self.rescan_fine_step          = max(5,  int(d.get("rescan_fine_step", 25)))
+        # A bare "T > T0" on single-frame stream Tenengrad picks directions out
+        # of measurement noise. Require a relative margin instead. Set to 0.0
+        # for literal greedy behaviour.
+        self.rescan_direction_margin   = float(d.get("rescan_direction_margin", 0.02))
+        # Median over N stream frames per measurement point. 1 = original
+        # single-frame behaviour.
+        self.rescan_measure_frames     = max(1, int(d.get("rescan_measure_frames", 3)))
+
 
 # ─── Main class ───────────────────────────────────────────────────────────────
 class AutoFocus:
@@ -132,6 +147,24 @@ class AutoFocus:
         arr  = np.frombuffer(frame, np.uint8)
         gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
         return self.tenengrad(gray) if gray is not None else 0.0
+
+    async def _tenengrad_median(self, n: int | None = None) -> float:
+        """
+        Median Tenengrad over n consecutive stream frames.
+
+        Single-frame Tenengrad on an MJPEG stream carries sensor noise, JPEG
+        quantisation noise and LED ripple. When the resulting number gates an
+        irreversible decision (overwrite the archived tile or not), that noise
+        matters; a small median is cheap insurance. n=1 reproduces the original
+        single-frame behaviour exactly.
+        """
+        n = self.config.rescan_measure_frames if n is None else max(1, int(n))
+        if n == 1:
+            return await self._tenengrad_from_stream()
+        samples = []
+        for _ in range(n):
+            samples.append(await self._tenengrad_from_stream())
+        return float(np.median(samples))
 
     # ── Ring range guard + CNC Z hill-climb ───────────────────────────────────
     async def _recenter_ring(self, loop) -> float | None:
@@ -321,6 +354,144 @@ class AutoFocus:
             best_T = await self._tenengrad_from_stream()
 
         return best_T
+
+    # ── End-of-scan rescan ladder (wide probe → fine climb → CNC Z) ───────────
+    async def _rescan_ring_stage(self, loop) -> tuple[bool, float, float]:
+        """
+        One ring stage of the rescan ladder.
+
+        1. Measure baseline T0 at the current ring position.
+        2. Probe +rescan_probe_steps and -rescan_probe_steps (wide, because a
+           rescan tile is spatially far from the last tile the ring was focused
+           on, so the ring may be well outside the region where a fine_step
+           gradient is measurable at all).
+        3. If neither side beats T0 by rescan_direction_margin, restore the
+           starting position and report failure — the caller escalates to Z.
+        4. Otherwise hill-climb toward the peak in rescan_fine_step increments,
+           then apply the same backlash-aware final approach as _tenengrad_climb.
+
+        Returns:
+            (direction_found, T_start, T_final)
+        """
+        cfg    = self.config
+        probe  = cfg.rescan_probe_steps
+        fs     = cfg.rescan_fine_step
+        margin = cfg.rescan_direction_margin
+
+        async def step_and_measure(steps: int) -> float:
+            if steps:
+                await loop.run_in_executor(None, self.canon.focus, steps)
+            await asyncio.sleep(0.5)
+            return await self._tenengrad_median()
+
+        T0 = await self._tenengrad_median()
+        threshold = T0 * (1.0 + margin)
+
+        # ── Wide direction probe ─────────────────────────────────────
+        T_plus  = await step_and_measure(+probe)          # now at P + probe
+        T_minus = await step_and_measure(-2 * probe)      # now at P - probe
+
+        if T_plus > threshold and T_plus >= T_minus:
+            await step_and_measure(+2 * probe)            # back to P + probe
+            direction, T_prev = +1, T_plus
+        elif T_minus > threshold:
+            direction, T_prev = -1, T_minus               # already at P - probe
+        else:
+            await loop.run_in_executor(None, self.canon.focus, +probe)  # back to P
+            await asyncio.sleep(0.3)
+            print(f"[AF] Rescan ring probe found no direction "
+                  f"(T0={T0:.1f}  +{probe}={T_plus:.1f}  -{probe}={T_minus:.1f})")
+            return False, T0, T0
+
+        print(f"[AF] Rescan ring direction={direction:+d} "
+              f"(T0={T0:.1f} → {T_prev:.1f}); climbing at {fs}/step")
+
+        # ── Fine hill-climb ──────────────────────────────────────────
+        best_T = T_prev
+        for _ in range(cfg.max_climb_iters):
+            T_new = await step_and_measure(direction * fs)
+            if T_new < best_T * (1.0 - cfg.decline_threshold):
+                await loop.run_in_executor(None, self.canon.focus, -direction * fs)
+                await asyncio.sleep(0.3)
+                break
+            best_T = T_new
+
+        # ── Backlash-aware final approach ────────────────────────────
+        if direction != cfg.backlash_dir:
+            await loop.run_in_executor(None, self.canon.focus,
+                                       -cfg.backlash_dir * cfg.backlash_steps)
+            await asyncio.sleep(0.03)
+            await loop.run_in_executor(None, self.canon.focus,
+                                       +cfg.backlash_dir * cfg.backlash_steps)
+            await asyncio.sleep(0.3)
+            best_T = await self._tenengrad_median()
+
+        return True, T0, best_T
+
+    async def run_rescan(self, loop) -> dict:
+        """
+        Focus ladder used by the end-of-scan reimage pass.
+
+        Stage 1 — ring only:
+            wide ±rescan_probe_steps direction probe, then a
+            rescan_fine_step hill-climb. If a direction is found, stop here.
+
+        Stage 2 — CNC Z escalation (only if stage 1 found no direction):
+            _z_tenengrad_climb (0.01 mm probes, 0.02 mm fallback probe,
+            0.05 mm hard travel cap), followed by a second ring stage for
+            fine focus.
+
+        Returns a diagnostics dict; the caller decides whether the resulting
+        tile is actually kept. This routine never writes anything.
+
+        NOTE: stage 2 leaves the CNC Z axis displaced. Nothing in the codebase
+        tracks or restores Z, so that displacement persists for every
+        subsequent tile in the audit and beyond. `z_escalated` is surfaced here
+        so the caller can log it.
+        """
+        if not (self.camera and self.canon and self.led):
+            print("[AF] run_rescan() called but hardware not bound — skipping.")
+            return {
+                "ok": False, "stage": "unbound", "direction_found": False,
+                "z_escalated": False, "t_start": 0.0, "t_final": 0.0,
+            }
+
+        try:
+            await self.led.async_on_axis()
+            await asyncio.sleep(0.45)
+
+            found, T0, T_final = await self._rescan_ring_stage(loop)
+            if found:
+                print(f"[AF] Rescan done (ring only). "
+                      f"T {T0:.1f} → {T_final:.1f}  ring_pos={self.canon.position}")
+                return {
+                    "ok": True, "stage": "ring", "direction_found": True,
+                    "z_escalated": False,
+                    "t_start": round(T0, 2), "t_final": round(T_final, 2),
+                }
+
+            if not self.cnc:
+                print("[AF] Rescan: no direction and no CNC bound — cannot escalate.")
+                return {
+                    "ok": False, "stage": "ring_failed", "direction_found": False,
+                    "z_escalated": False,
+                    "t_start": round(T0, 2), "t_final": round(T0, 2),
+                }
+
+            print("[AF] Rescan: escalating to CNC Z climb.")
+            T_z = await self._z_tenengrad_climb(loop)
+            print(f"[AF] Rescan Z stage done. T={T_z:.1f}")
+
+            _, _, T_final = await self._rescan_ring_stage(loop)
+            print(f"[AF] Rescan done (Z + ring). "
+                  f"T {T0:.1f} → {T_final:.1f}  ring_pos={self.canon.position}")
+            return {
+                "ok": True, "stage": "z+ring", "direction_found": False,
+                "z_escalated": True,
+                "t_start": round(T0, 2), "t_final": round(T_final, 2),
+            }
+        finally:
+            await self.led.async_on_axis()
 
     # ── Main AF entry point ────────────────────────────────────────────────────
     async def run(self, loop) -> float:

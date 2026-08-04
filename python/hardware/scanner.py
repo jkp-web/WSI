@@ -35,6 +35,19 @@ CROP_MARGIN_PX: int = 500
 AUTOFOCUS_MIN_TISSUE_FRACTION: float = 0.10
 EDGE_TISSUE_FRACTION: float = 0.25  # below this, treat tile as tissue-edge — relax global gate
 
+# ── End-of-scan rescan acceptance ────────────────────────────────────────────
+# A rescan candidate is written here first, scored, and only promoted over the
+# original if it is meaningfully better. Lives under scan_live_dir so it is
+# served at /tmp_scan (the operator can eyeball a candidate during a manual
+# intervention pause) and so storage.clear_tmp('scan_thumbs') sweeps it up.
+RESCAN_TMP_DIRNAME: str = "rescan_tmp"
+# Required relative improvement in archive-quality Tenengrad before the original
+# tile is overwritten without asking. Below this → manual intervention.
+# NOTE: 0.10 is a starting guess, not a measured value. Calibrate it against the
+# repeat-capture noise floor: park on a tile, take ~5 SNAPs without moving
+# anything, and look at the spread of the scores.
+RESCAN_MIN_IMPROVEMENT: float = 0.10
+
 # Fiji tile coordinates are derived from tile row/col indices using the
 # empirically measured affine offsets below.
 FIJI_X_FROM_ROW: int = 380
@@ -121,6 +134,52 @@ class ScannerRoutine:
             return img
         return img[margin_px:h - margin_px, margin_px:w - margin_px]
 
+    def _prepare_tile_array(self, img: np.ndarray) -> np.ndarray:
+        """Flatfield-correct then vignette-crop a raw SNAP array."""
+        if self.ffc is not None:
+            img = self.ffc.apply(img)
+        return self.crop_vignette_edges(img)
+
+    @staticmethod
+    def _write_tile_jpeg(img: np.ndarray, dest_path: str) -> None:
+        """Write a prepared tile array to dest_path at q95."""
+        if not cv2.imwrite(
+            dest_path,
+            img,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+        ):
+            raise RuntimeError(f"Failed to write tile image: {dest_path}")
+
+    @staticmethod
+    def _write_thumbnail(img: np.ndarray, row: int, col: int) -> str:
+        """Write the 160x120 preview thumbnail for a tile. Returns its filename."""
+        thumb_filename = f"thumb_r{row:03d}_c{col:03d}.jpg"
+        thumb_path = os.path.join(storage.scan_live_dir, thumb_filename)
+        thumb = cv2.resize(img, (160, 120))
+        cv2.imwrite(
+            thumb_path,
+            thumb,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+        )
+        return thumb_filename
+
+    def _score_tile_file(self, tile_path: str) -> float | None:
+        """
+        Archive-quality Tenengrad read back from a saved JPEG.
+
+        Deliberately scores the file on disk, not the in-memory array, so that
+        it is directly comparable with _assess_saved_tile_focus(): both then
+        include the same q95 encode/decode roundtrip. Scoring one side in
+        memory and the other after a roundtrip biases the comparison in favour
+        of the in-memory side, because q95 attenuates exactly the high
+        frequencies Tenengrad measures.
+        """
+        img = cv2.imread(tile_path, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return round(self.tenengrad(gray), 2)
+
     def _store_tile_image(
         self,
         img: np.ndarray,
@@ -130,32 +189,21 @@ class ScannerRoutine:
     ) -> tuple[float, str]:
         """
         Crop, save, score, and thumbnail a high-resolution tile image.
+
+        NOTE: destructive — overwrites tile_path and the tile's thumbnail
+        unconditionally. Do not call this to "find out" how good a capture is;
+        use _prepare_tile_array + _write_tile_jpeg + _score_tile_file instead.
+
         Returns:
             (tenengrad_score, thumb_filename)
         """
-        if self.ffc is not None:
-            img = self.ffc.apply(img)
-
-        img = self.crop_vignette_edges(img)
-
-        if not cv2.imwrite(
-            tile_path,
-            img,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 95]
-        ):
-            raise RuntimeError(f"Failed to write tile image: {tile_path}")
+        img = self._prepare_tile_array(img)
+        self._write_tile_jpeg(img, tile_path)
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         tenengrad_score = round(self.tenengrad(gray), 2)
 
-        thumb_filename = f"thumb_r{row:03d}_c{col:03d}.jpg"
-        thumb_path = os.path.join(storage.scan_live_dir, thumb_filename)
-        thumb = cv2.resize(img, (160, 120))
-        cv2.imwrite(
-            thumb_path,
-            thumb,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 70]
-        )
+        thumb_filename = self._write_thumbnail(img, row, col)
         return tenengrad_score, thumb_filename
 
     @staticmethod
@@ -331,7 +379,13 @@ class ScannerRoutine:
             )
         user_skipped_count = len(flagged_tiles) - len(bad_tiles)
 
+        rescan_tmp_dir = os.path.join(tile_dir, RESCAN_TMP_DIRNAME)
+        os.makedirs(rescan_tmp_dir, exist_ok=True)
+
         reimaged_tiles = 0
+        rejected_tiles = 0
+        manual_reviews = 0
+        z_escalations  = 0
         for idx, tile in enumerate(bad_tiles):
             if not self.is_scanning:
                 print("[Scan] Focus audit stopped by user.")
@@ -362,79 +416,156 @@ class ScannerRoutine:
             await loop.run_in_executor(None, self.cnc.wait_for_idle_blocking)
             await asyncio.sleep(settle_time)
 
+            # ── Focus ladder: wide ring probe → fine climb → CNC Z escalation ──
+            af_result = {}
             if self.autofocus and self.canon:
-                await self.autofocus.run(loop)
+                af_result = await self.autofocus.run_rescan(loop)
+                if af_result.get("z_escalated"):
+                    z_escalations += 1
 
-            snap_bytes = None
-            try:
-                snap_bytes = await self.camera.snap(timeout=15.0)
-            except Exception as e:
-                print(f"[Scan] Reimage SNAP error at ({x_mm:.3f}, {y_mm:.3f}): {e}")
+            original_score = float(tile["tanengrad"])
+            tmp_path = os.path.join(rescan_tmp_dir, filename)
 
-            if not snap_bytes:
-                continue
-
-            try:
-                arr = np.frombuffer(snap_bytes, np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                if img is None:
-                    raise RuntimeError("Failed to decode reimage SNAP JPEG")
-
-                tenengrad_score, thumb_filename = self._store_tile_image(
-                    img, tile_path, row, col
-                )
-                reimaged_tiles += 1
-                export_filename = None
-                if export_dir and export_lookup:
-                    export_filename = export_lookup.get(filename)
-                    if export_filename:
-                        export_path = os.path.join(export_dir, export_filename)
-                        shutil.copyfile(tile_path, export_path)
-
+            candidate_score = await self._capture_rescan_candidate(tmp_path)
+            if candidate_score is None:
+                print(f"[Scan] Rescan capture failed r{row:03d} c{col:03d} "
+                      f"— original left untouched.")
+                self._discard_rescan_candidate(tmp_path)
                 with open(log_path, 'a') as f:
                     f.write(json.dumps({
-                        "event": "scan_tile_reimage",
-                        "col": col,
-                        "row": row,
-                        "x_mm": x_mm,
-                        "y_mm": y_mm,
-                        "filename": filename,
-                        "export_filename": export_filename,
-                        "tenengrad_before": tile["tanengrad"],
-                        "tenengrad_after": tenengrad_score,
-                        "flag_reason": tile["flag_reason"],
-                        "local_reference": tile["local_reference"],
-                        "global_tanengrad_median": round(global_median, 2),
+                        "event": "rescan_capture_failed",
+                        "col": col, "row": row, "filename": filename,
                         "timestamp": round(time.time(), 3),
                     }) + '\n')
+                continue
 
-                print(f"[Scan] Reimaged tile r{row:03d} c{col:03d}  "
-                      f"T {tile['tanengrad']:.1f} -> {tenengrad_score:.1f}")
+            improvement = self._relative_improvement(original_score, candidate_score)
+            accepted    = improvement >= RESCAN_MIN_IMPROVEMENT
+            manual_used = False
 
-                await self.event_queue.put({
-                    "event": "scan_tile",
+            # ── Below the improvement bar → hand it to the operator ────────
+            if not accepted:
+                print(f"[Scan] Rescan r{row:03d} c{col:03d} improvement "
+                      f"{improvement * 100:+.1f}% < "
+                      f"{RESCAN_MIN_IMPROVEMENT * 100:.0f}% — requesting manual focus.")
+                manual_used = True
+                manual_reviews += 1
+                self._discard_rescan_candidate(tmp_path)
+
+                await self._pause_for_manual_focus(
+                    tile_idx=total_tiles + idx,
+                    col=col, row=row, x_mm=x_mm, y_mm=y_mm,
+                    tenengrad=original_score,
+                    reason="rescan_insufficient_improvement",
+                    extra={
+                        "original_tenengrad":  original_score,
+                        "candidate_tenengrad": candidate_score,
+                        "improvement_pct":     round(improvement * 100, 2),
+                        "required_pct":        round(RESCAN_MIN_IMPROVEMENT * 100, 2),
+                        "local_reference":     tile["local_reference"],
+                        "flag_reason":         tile["flag_reason"],
+                        "af_stage":            af_result.get("stage"),
+                    },
+                )
+
+                if not self.is_scanning:
+                    print("[Scan] Focus audit stopped during manual focus.")
+                    break
+
+                # One post-intervention capture. A human has adjusted focus, so
+                # accept any real improvement — but still never accept a worse
+                # tile than the one already on disk.
+                candidate_score = await self._capture_rescan_candidate(tmp_path)
+                if candidate_score is None:
+                    print(f"[Scan] Post-manual capture failed r{row:03d} c{col:03d}.")
+                    self._discard_rescan_candidate(tmp_path)
+                    continue
+                improvement = self._relative_improvement(original_score, candidate_score)
+                accepted    = candidate_score > original_score
+
+            # ── Promote or discard ────────────────────────────────────────
+            export_filename = None
+            thumb_filename  = f"thumb_r{row:03d}_c{col:03d}.jpg"
+
+            if accepted:
+                try:
+                    export_filename = self._promote_rescan_candidate(
+                        tmp_path, tile_path, row, col, export_dir, export_lookup
+                    )
+                    reimaged_tiles += 1
+                except Exception as e:
+                    print(f"[Scan] Failed to promote rescan r{row:03d} c{col:03d}: {e}")
+                    self._discard_rescan_candidate(tmp_path)
+                    continue
+                print(f"[Scan] Rescan ACCEPTED r{row:03d} c{col:03d}  "
+                      f"T {original_score:.1f} -> {candidate_score:.1f} "
+                      f"({improvement * 100:+.1f}%)"
+                      f"{'  [manual]' if manual_used else ''}"
+                      f"{'  [z]' if af_result.get('z_escalated') else ''}")
+            else:
+                rejected_tiles += 1
+                self._discard_rescan_candidate(tmp_path)
+                print(f"[Scan] Rescan REJECTED r{row:03d} c{col:03d}  "
+                      f"T {original_score:.1f} vs {candidate_score:.1f} "
+                      f"({improvement * 100:+.1f}%) — original kept.")
+
+            with open(log_path, 'a') as f:
+                f.write(json.dumps({
+                    "event": "scan_tile_reimage" if accepted else "rescan_rejected",
                     "col": col,
                     "row": row,
                     "x_mm": x_mm,
                     "y_mm": y_mm,
                     "filename": filename,
                     "export_filename": export_filename,
-                    "thumb_name": thumb_filename,
-                    "captured": True,
-                    "tenengrad": tenengrad_score,
-                    "tenengrad_stream": None,
-                    "af_triggered": bool(self.autofocus and self.canon),
-                    "global_median": round(self.global_tenengrad_median, 2),
-                    "tile_index": total_tiles + idx,
-                    "total_tiles": total_tiles + len(bad_tiles),
-                    "captured_count": captured_count,
-                    "step_mm": scan_step_mm,
-                    "grid_cols": grid_cols,
-                    "grid_rows": grid_rows,
-                    "reimaged": True,
-                })
-            except Exception as e:
-                print(f"[Scan] Failed to reimage tile r{row:03d} c{col:03d}: {e}")
+                    "tenengrad_before": original_score,
+                    "tenengrad_after": candidate_score,
+                    "improvement_pct": round(improvement * 100, 2),
+                    "required_pct": round(RESCAN_MIN_IMPROVEMENT * 100, 2),
+                    "accepted": accepted,
+                    "manual_intervention": manual_used,
+                    "af_stage": af_result.get("stage"),
+                    "af_direction_found": af_result.get("direction_found"),
+                    "af_z_escalated": af_result.get("z_escalated"),
+                    "af_stream_t_start": af_result.get("t_start"),
+                    "af_stream_t_final": af_result.get("t_final"),
+                    "flag_reason": tile["flag_reason"],
+                    "local_reference": tile["local_reference"],
+                    "global_tanengrad_median": round(global_median, 2),
+                    "timestamp": round(time.time(), 3),
+                }) + '\n')
+
+            await self.event_queue.put({
+                "event": "scan_tile",
+                "col": col,
+                "row": row,
+                "x_mm": x_mm,
+                "y_mm": y_mm,
+                "filename": filename,
+                "export_filename": export_filename,
+                "thumb_name": thumb_filename,
+                "captured": True,
+                "tenengrad": candidate_score if accepted else original_score,
+                "tenengrad_stream": None,
+                "af_triggered": bool(self.autofocus and self.canon),
+                "global_median": round(self.global_tenengrad_median, 2),
+                "tile_index": total_tiles + idx,
+                "total_tiles": total_tiles + len(bad_tiles),
+                "captured_count": captured_count,
+                "step_mm": scan_step_mm,
+                "grid_cols": grid_cols,
+                "grid_rows": grid_rows,
+                "reimaged": accepted,
+                "rescan_rejected": not accepted,
+                "rescan_improvement_pct": round(improvement * 100, 2),
+                "rescan_manual": manual_used,
+            })
+
+        try:
+            if os.path.isdir(rescan_tmp_dir) and not os.listdir(rescan_tmp_dir):
+                os.rmdir(rescan_tmp_dir)
+        except OSError:
+            pass
 
         return {
             "audited_tiles": len(assessments),
@@ -444,7 +575,86 @@ class ScannerRoutine:
             "user_selected_for_reimage": len(bad_tiles),
             "user_skipped": user_skipped_count,
             "reimaged_tiles": reimaged_tiles,
+            "rescan_rejected_tiles": rejected_tiles,
+            "rescan_manual_interventions": manual_reviews,
+            "rescan_z_escalations": z_escalations,
+            "rescan_min_improvement": RESCAN_MIN_IMPROVEMENT,
         }
+
+    # ── Rescan candidate capture / promotion helpers ──────────────────────────
+    @staticmethod
+    def _relative_improvement(original: float, candidate: float) -> float:
+        """Relative improvement of candidate over original. 0.0 if original is 0."""
+        if original <= 0:
+            return 0.0
+        return (candidate - original) / original
+
+    async def _capture_rescan_candidate(self, tmp_path: str) -> float | None:
+        """
+        SNAP, flatfield, crop, write to tmp_path, then score the written file.
+
+        Nothing in the live tile directory is touched. Returns the candidate's
+        archive-quality Tenengrad, or None if capture/decode/write failed.
+        """
+        snap_bytes = None
+        try:
+            snap_bytes = await self.camera.snap(timeout=15.0)
+        except Exception as e:
+            print(f"[Scan] Rescan SNAP error: {e}")
+        if not snap_bytes:
+            return None
+
+        try:
+            arr = np.frombuffer(snap_bytes, np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError("Failed to decode rescan SNAP JPEG")
+            img = self._prepare_tile_array(img)
+            self._write_tile_jpeg(img, tmp_path)
+        except Exception as e:
+            print(f"[Scan] Rescan candidate write failed: {e}")
+            return None
+
+        return self._score_tile_file(tmp_path)
+
+    def _promote_rescan_candidate(
+            self,
+            tmp_path: str,
+            tile_path: str,
+            row: int,
+            col: int,
+            export_dir: str | None,
+            export_lookup: dict[str, str] | None,
+    ) -> str | None:
+        """
+        Replace the original tile with an accepted rescan candidate, refresh its
+        thumbnail, and refresh the export copy. Returns the export filename, or
+        None if this tile has no export slot.
+        """
+        shutil.move(tmp_path, tile_path)
+
+        promoted = cv2.imread(tile_path, cv2.IMREAD_COLOR)
+        if promoted is not None:
+            self._write_thumbnail(promoted, row, col)
+
+        filename = os.path.basename(tile_path)
+        export_filename = None
+        if export_dir and export_lookup:
+            export_filename = export_lookup.get(filename)
+            if export_filename:
+                shutil.copyfile(tile_path, os.path.join(export_dir, export_filename))
+            else:
+                print(f"[Scan] WARNING: promoted {filename} has no export slot — "
+                      f"the export bundle still holds the pre-rescan tile.")
+        return export_filename
+
+    @staticmethod
+    def _discard_rescan_candidate(tmp_path: str) -> None:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError as e:
+            print(f"[Scan] Could not remove rescan tmp file {tmp_path}: {e}")
 
     async def _review_reimage_candidates(
             self,
@@ -564,7 +774,7 @@ class ScannerRoutine:
 
         return False, tissue_mask
 
-    async def run_prescan(self, step_mm=0.4, max_cols=15, max_rows=15):
+    async def run_prescan(self, step_mm=0.4, max_cols=17, max_rows=17):
         """Systematic snake-pattern grid prescan — identifies tissue tile positions."""
         self.is_scanning = True
         self.tissue_coordinates = []
@@ -1452,10 +1662,14 @@ class ScannerRoutine:
     # PHASE 2 — Manual focus pause helper
     # ==================================================================
 
-    async def _pause_for_manual_focus(self, tile_idx, col, row, x_mm, y_mm, tenengrad):
+    async def _pause_for_manual_focus(self, tile_idx, col, row, x_mm, y_mm, tenengrad,
+                                      reason: str = "focus_failure",
+                                      extra: dict | None = None):
         """
         Pause the scan and wait for the user to manually re-focus.
-        Resumes when /api/scan/resume is called (sets self.resume_event).
+        Resumes when /api/scan/resume is called (sets self.resume_event), or
+        when stop() is called — see stop(), which releases resume_event so this
+        cannot hang the run.
         """
         self.is_paused = True
         self.resume_event.clear()
@@ -1464,9 +1678,9 @@ class ScannerRoutine:
               f"T={tenengrad:.0f}  global_median={self.global_tenengrad_median:.0f}")
         print("[Scan]    Paused — waiting for manual re-focus and /api/scan/resume")
 
-        await self.event_queue.put({
+        payload = {
             "event":         "scan_paused",
-            "reason":        "focus_failure",
+            "reason":        reason,
             "tile_index":    tile_idx,
             "col":           col,
             "row":           row,
@@ -1475,7 +1689,16 @@ class ScannerRoutine:
             "tenengrad":     round(tenengrad, 1),
             "global_median": round(self.global_tenengrad_median, 1),
             "message":       "AF could not recover focus. Adjust manually, then click Resume.",
-        })
+        }
+        if extra:
+            payload.update(extra)
+            payload["message"] = (
+                f"Rescan improved focus by only {extra.get('improvement_pct', 0):+.1f}% "
+                f"(need {extra.get('required_pct', 0):.0f}%). Adjust manually, then Resume — "
+                f"the new capture is kept only if it beats the original."
+            )
+
+        await self.event_queue.put(payload)
 
         await self.resume_event.wait()
         self.resume_event.clear()
@@ -1491,4 +1714,11 @@ class ScannerRoutine:
         if self.awaiting_reimage_review:
             self.reimage_selected_filenames = []
             self.reimage_decision_event.set()
+        # Release any manual-focus pause. Without this, a run stopped while
+        # _pause_for_manual_focus() is awaiting resume_event blocks forever:
+        # the CNC stays parked mid-slide and TileConfiguration.txt /
+        # scan_config.json are never written. Callers re-check is_scanning
+        # immediately after the pause returns.
+        if self.is_paused:
+            self.resume_event.set()
         print("[Scanner] Stop signal sent.")

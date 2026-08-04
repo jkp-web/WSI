@@ -109,8 +109,8 @@ class LedModePayload(BaseModel):
     mode: int   # 1 = on-axis (brightfield), 2 = off-axis (AF)
 
 class ConnectHardwarePayload(BaseModel):
-    cnc_port:    str = "/dev/ttyUSB0"
-    canon_port:  str = "/dev/ttyUSB2"
+    cnc_port:    str = "/dev/ttyUSB1"
+    canon_port:  str = "/dev/ttyUSB0"
     led_port:    str = "/dev/ttyUSB1"   # Adjust to match your LED Arduino
 
 class HighResScanPayload(BaseModel):
